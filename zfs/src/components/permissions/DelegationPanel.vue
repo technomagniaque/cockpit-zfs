@@ -147,7 +147,7 @@ async function revoke(section: SectionKey, row: Row) {
 	busy.value = true;
 	try {
 		const scope = section === 'local' ? 'local' : section === 'descendent' ? 'descendent' : 'both';
-		const r = await delegate({ dataset: props.dataset, op: 'unallow', kind: row.kind, who: row.who, scope, perms: row.perms });
+		const r = await delegate({ dataset: props.dataset, op: 'unallow', kind: row.kind, who: row.who, scope, perms: row.perms, dry_run: false });
 		pushNotification(new Notification('Délégation retirée', r.command, 'success', 5000));
 		await load();
 	} catch (e: any) {
@@ -160,7 +160,7 @@ async function revoke(section: SectionKey, row: Row) {
 async function submit() {
 	busy.value = true;
 	try {
-		const r = await delegate({ dataset: props.dataset, op: 'allow', kind: form.kind, who: form.who, scope: form.scope, perms: allPerms.value });
+		const r = await delegate({ dataset: props.dataset, op: 'allow', kind: form.kind, who: form.who, scope: form.scope, perms: allPerms.value, dry_run: false });
 		pushNotification(new Notification('Délégation ajoutée', r.command, 'success', 5000));
 		form.perms = [];
 		extra.value = '';

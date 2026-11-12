@@ -4,7 +4,7 @@ Backend de gestion avancée des permissions pour cockpit-zfs.
 
 Usage :  zfs-permissions.py <commande> '<json des paramètres>'
 
-Toujours imprime un objet JSON sur stdout :
+Toujours imprime un objet JSON (ASCII, noms non UTF-8 échappés) sur stdout :
     {"ok": true, ...}            en cas de succès
     {"ok": false, "error": ...}  en cas d'échec (code de sortie 0 pour que
                                  l'interface puisse afficher le message)
@@ -20,10 +20,24 @@ Commandes :
     delegate         ajout / retrait d'une délégation « zfs allow / zfs unallow »
     preset           application d'un préréglage de propriétés ACL sur un dataset
 
-Toutes les commandes qui modifient quelque chose acceptent "dry_run": true, qui
-renvoie le plan (nombre d'objets touchés, échantillon, commandes) sans rien écrire.
+Toutes les commandes qui modifient quelque chose acceptent "dry_run": true
+(valeur par défaut), qui renvoie le plan sans rien écrire.
+
+Sécurité (le script tourne en root sur des arbres où des utilisateurs écrivent) :
+  - le parcours et toutes les modifications se font par descripteurs de
+    fichiers ouverts composant par composant avec O_NOFOLLOW : un dossier
+    remplacé par un lien symbolique pendant l'opération ne peut pas rediriger
+    une écriture hors de l'arbre ;
+  - seuls les fichiers réguliers et les dossiers sont ouverts (jamais les
+    périphériques, FIFO ou sockets) ;
+  - les ACL POSIX sont lues / écrites directement dans les xattrs
+    system.posix_acl_access / system.posix_acl_default du descripteur ;
+  - les datasets enfants ne sont pas traversés sauf demande explicite ;
+  - écriture refusée sur un chemin contenant un lien symbolique, sur / et sur
+    les datasets système (montés sur /, /usr, /var…).
 """
 
+import base64
 import errno
 import fcntl
 import fnmatch
@@ -42,12 +56,12 @@ import time
 BACKUP_DIR = os.environ.get("COCKPIT_ZFS_PERM_BACKUP_DIR", "/var/lib/cockpit-zfs/permission-backups")
 SAMPLE_LIMIT = 50
 FINDING_LIMIT = 200
-CHUNK = 400  # nombre de chemins par invocation de setfacl / chown
 
 FS_IOC_GETFLAGS = 0x80086601
 FS_IOC_SETFLAGS = 0x40086602
 FS_IMMUTABLE_FL = 0x00000010
 FS_APPEND_FL = 0x00000020
+PROTECT_FLAGS = FS_IMMUTABLE_FL | FS_APPEND_FL
 
 ACL_PROPS = [
     "type", "mountpoint", "mounted", "readonly", "acltype", "aclmode",
@@ -57,8 +71,20 @@ ACL_PROPS = [
 
 NTACL_XATTR = "security.NTACL"
 DOSATTRIB_XATTR = "user.DOSATTRIB"
-POSIX_ACCESS_XATTR = "system.posix_acl_access"
-POSIX_DEFAULT_XATTR = "system.posix_acl_default"
+ACCESS_XATTR = "system.posix_acl_access"
+DEFAULT_XATTR = "system.posix_acl_default"
+
+OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+OPEN_FILE = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+SPECIAL_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+
+# Points de montage de datasets « système » sur lesquels l'écriture est refusée
+SYSTEM_MOUNTS = {
+    "/", "/etc", "/usr", "/usr/local", "/var", "/var/lib", "/var/log", "/var/cache",
+    "/var/tmp", "/var/spool", "/var/mail", "/boot", "/root", "/bin", "/sbin", "/lib",
+    "/lib32", "/lib64", "/libx32", "/opt", "/srv", "/tmp", "/run", "/proc", "/sys", "/dev",
+}
 
 PRESETS = {
     "posixacl-smb": {
@@ -79,13 +105,15 @@ PRESETS = {
     },
 }
 
+# valeurs équivalentes renvoyées par les différentes versions d'OpenZFS
+PROP_ALIASES = {"acltype": {"posix": "posixacl", "noacl": "off"}}
+
 ZFS_DELEGATION_PERMS = [
     "allow", "clone", "create", "destroy", "diff", "hold", "load-key", "change-key",
     "mount", "promote", "receive", "release", "rename", "rollback", "send", "share",
     "snapshot", "bookmark", "groupquota", "groupobjquota", "groupused", "groupobjused",
     "projectid", "projectquota", "projectobjquota", "projectused", "projectobjused",
     "userprop", "userquota", "userobjquota", "userused", "userobjused",
-    # propriétés déléguables les plus utiles
     "aclinherit", "aclmode", "acltype", "atime", "canmount", "casesensitivity",
     "checksum", "compression", "copies", "dedup", "devices", "dnodesize", "exec",
     "filesystem_limit", "keyformat", "keylocation", "logbias", "mountpoint",
@@ -97,12 +125,12 @@ ZFS_DELEGATION_PERMS = [
 
 RESET_METHODS = {
     "unix-mode": "Mode Unix uniforme (propriétaire, groupe, modes fichiers/dossiers, setgid)",
-    "strip-acl": "Retirer toutes les ACL étendues (setfacl -b), garder le mode",
+    "strip-acl": "Retirer toutes les ACL étendues, garder le mode",
     "acl-template": "Appliquer un modèle d'ACL (entrées nommées + ACL par défaut héritables)",
     "inherit-parent": "Propager l'ACL par défaut du dossier racine (comme « remplacer les permissions enfants »)",
     "mirror-reference": "Copier les permissions d'un fichier / dossier de référence",
     "from-snapshot": "Restaurer propriétaires, modes et ACL depuis un snapshot ZFS (sans toucher aux données)",
-    "from-backup": "Restaurer une sauvegarde de permissions (getfacl)",
+    "from-backup": "Restaurer une sauvegarde de permissions",
     "clear-ntacl": "Effacer les ACL NT stockées par Samba / ksmbd (security.NTACL, option DOSATTRIB)",
     "orphans": "Réattribuer les fichiers dont l'UID / GID n'existe plus",
     "takeown": "Changer propriétaire / groupe récursivement sans toucher aux modes",
@@ -116,21 +144,13 @@ class PermError(Exception):
 
 # --------------------------------------------------------------------------- utilitaires
 
-def run(cmd, input_data=None, check=True):
-    proc = subprocess.run(
-        cmd, input=input_data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    )
+def run(cmd, check=True):
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out = proc.stdout.decode("utf-8", "surrogateescape")
+    err = proc.stderr.decode("utf-8", "replace")
     if check and proc.returncode != 0:
-        raise PermError("%s : %s" % (" ".join(cmd[:3]), proc.stderr.strip() or "code %d" % proc.returncode))
-    return proc
-
-
-def have(binary):
-    for d in os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin").split(":") + ["/usr/sbin", "/sbin"]:
-        if os.access(os.path.join(d, binary), os.X_OK):
-            return True
-    return False
+        raise PermError("%s : %s" % (" ".join(cmd[:3]), err.strip() or "code %d" % proc.returncode))
+    return proc.returncode, out, err
 
 
 _uid_cache, _gid_cache = {}, {}
@@ -154,22 +174,35 @@ def gid_name(gid):
     return _gid_cache[gid]
 
 
-def resolve_uid(owner):
+def _check_name(name, what):
+    if not name or "\n" in name or ":" in name or "," in name or name.startswith("-"):
+        raise PermError("%s invalide : %r" % (what, name))
+
+
+def resolve_uid(owner, allow_empty=True):
     if owner is None or owner == "":
-        return -1
-    if str(owner).isdigit():
+        if allow_empty:
+            return -1
+        raise PermError("Utilisateur requis")
+    owner = str(owner)
+    if owner.isdigit():
         return int(owner)
+    _check_name(owner, "Utilisateur")
     try:
         return pwd.getpwnam(owner).pw_uid
     except KeyError:
         raise PermError("Utilisateur inconnu : %s" % owner)
 
 
-def resolve_gid(group):
+def resolve_gid(group, allow_empty=True):
     if group is None or group == "":
-        return -1
-    if str(group).isdigit():
+        if allow_empty:
+            return -1
+        raise PermError("Groupe requis")
+    group = str(group)
+    if group.isdigit():
         return int(group)
+    _check_name(group, "Groupe")
     try:
         return grp.getgrnam(group).gr_gid
     except KeyError:
@@ -192,39 +225,222 @@ def mode_str(mode):
     return "%04o" % stat.S_IMODE(mode)
 
 
-def list_xattrs(path):
-    try:
-        return os.listxattr(path, follow_symlinks=False)
-    except OSError:
-        return []
+def b64(data):
+    return None if data is None else base64.b64encode(data).decode("ascii")
 
 
-def get_fsflags(path):
+def unb64(text):
+    return None if text is None else base64.b64decode(text)
+
+
+def fd_getxattr(fd, name):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
-        return None
+        return os.getxattr(fd, name)
+    except OSError as e:
+        if e.errno in (errno.ENODATA, errno.EOPNOTSUPP, errno.ENOTSUP):
+            return None
+        raise
+
+
+def fd_removexattr(fd, name):
+    try:
+        os.removexattr(fd, name)
+    except OSError as e:
+        if e.errno not in (errno.ENODATA, errno.EOPNOTSUPP, errno.ENOTSUP):
+            raise
+
+
+def get_fsflags_fd(fd):
     try:
         buf = fcntl.ioctl(fd, FS_IOC_GETFLAGS, struct.pack("i", 0))
         return struct.unpack("i", buf)[0]
     except OSError:
         return None
-    finally:
-        os.close(fd)
 
 
-def set_fsflags(path, flags):
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    try:
-        fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("i", flags))
-    finally:
-        os.close(fd)
+def set_fsflags_fd(fd, flags):
+    fcntl.ioctl(fd, FS_IOC_SETFLAGS, struct.pack("i", flags))
+
+
+# --------------------------------------------------------------------------- ACL POSIX (format xattr)
+
+ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20
+ACL_UNDEFINED_ID = 0xFFFFFFFF
+TAG_NAMES = {ACL_USER_OBJ: ("user", False), ACL_USER: ("user", True), ACL_GROUP_OBJ: ("group", False),
+             ACL_GROUP: ("group", True), ACL_MASK: ("mask", False), ACL_OTHER: ("other", False)}
+
+
+def decode_acl(raw):
+    """xattr posix_acl v2 → liste de (tag, perm, id|None)."""
+    if not raw or len(raw) < 4:
+        return []
+    (version,) = struct.unpack_from("<I", raw, 0)
+    if version != 2:
+        raise PermError("Format d'ACL inconnu (version %d)" % version)
+    out = []
+    for off in range(4, len(raw) - 7, 8):
+        tag, perm, ident = struct.unpack_from("<HHI", raw, off)
+        out.append((tag, perm & 7, ident if tag in (ACL_USER, ACL_GROUP) else None))
+    return out
+
+
+def encode_acl(entries):
+    ents = sorted(entries, key=lambda e: (e[0], e[2] if e[2] is not None else 0))
+    data = struct.pack("<I", 2)
+    for tag, perm, ident in ents:
+        data += struct.pack("<HHI", tag, perm & 7, ident if ident is not None else ACL_UNDEFINED_ID)
+    return data
+
+
+def base_from_mode(mode):
+    return [(ACL_USER_OBJ, (mode >> 6) & 7, None), (ACL_GROUP_OBJ, (mode >> 3) & 7, None),
+            (ACL_OTHER, mode & 7, None)]
+
+
+def acl_get(acl, tag):
+    for e in acl:
+        if e[0] == tag:
+            return e[1]
+    return None
+
+
+def is_minimal(acl):
+    return not any(e[0] in (ACL_USER, ACL_GROUP, ACL_MASK) for e in acl)
+
+
+def with_mask(acl, explicit_mask=None):
+    """Recalcule le masque (union de la classe groupe) comme setfacl, ou le retire
+    s'il n'y a plus d'entrées nommées."""
+    named = [e for e in acl if e[0] in (ACL_USER, ACL_GROUP)]
+    acl = [e for e in acl if e[0] != ACL_MASK]
+    if not named:
+        return acl
+    if explicit_mask is None:
+        explicit_mask = 0
+        for e in acl:
+            if e[0] in (ACL_USER, ACL_GROUP, ACL_GROUP_OBJ):
+                explicit_mask |= e[1]
+    return acl + [(ACL_MASK, explicit_mask, None)]
+
+
+def read_access(fd, st):
+    raw = fd_getxattr(fd, ACCESS_XATTR)
+    return decode_acl(raw) if raw else base_from_mode(st.st_mode)
+
+
+def read_default(fd):
+    raw = fd_getxattr(fd, DEFAULT_XATTR)
+    return decode_acl(raw) if raw else []
+
+
+def write_access(fd, acl):
+    """Écrit l'ACL d'accès ; une ACL minimale devient un simple mode (bits spéciaux conservés)."""
+    if is_minimal(acl):
+        cur = os.fstat(fd).st_mode
+        mode = (stat.S_IMODE(cur) & SPECIAL_BITS) | (acl_get(acl, ACL_USER_OBJ) << 6) \
+            | (acl_get(acl, ACL_GROUP_OBJ) << 3) | acl_get(acl, ACL_OTHER)
+        os.fchmod(fd, mode)
+        fd_removexattr(fd, ACCESS_XATTR)
+    else:
+        os.setxattr(fd, ACCESS_XATTR, encode_acl(acl))
+
+
+def write_default(fd, acl):
+    if not acl:
+        fd_removexattr(fd, DEFAULT_XATTR)
+    else:
+        os.setxattr(fd, DEFAULT_XATTR, encode_acl(acl))
+
+
+def strip_access(fd, st):
+    """Équivalent de setfacl -b sur l'ACL d'accès : le groupe reprend l'entrée
+    group:: réelle (et non le masque)."""
+    acl = read_access(fd, st)
+    if is_minimal(acl) and fd_getxattr(fd, ACCESS_XATTR) is None:
+        return False
+    base = [e for e in acl if e[0] in (ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER)]
+    write_access(fd, base)
+    return True
+
+
+def parse_perms(perms):
+    """'rwX' → (bits, x_conditionnel)."""
+    if not isinstance(perms, str) or not re.fullmatch(r"[r-][w-][xX-]", perms):
+        raise PermError("Permissions invalides : %r (format rwx)" % (perms,))
+    bits = (4 if perms[0] == "r" else 0) | (2 if perms[1] == "w" else 0) | (1 if perms[2] == "x" else 0)
+    return bits, perms[2] == "X"
+
+
+def resolve_x(bits, cond, is_dir, st_mode):
+    """X : exécution seulement pour un dossier ou un fichier déjà exécutable."""
+    if cond and (is_dir or st_mode & 0o111):
+        bits |= 1
+    return bits
+
+
+def ui_entries_to_acl(entries, is_dir, st_mode, x_to_cond=False):
+    """Entrées de l'interface ({tag, qualifier, perms}) → ACL interne."""
+    acl = {}
+    mask = None
+    for e in entries:
+        tag = e.get("tag")
+        qual = str(e.get("qualifier") or e.get("name") or "")
+        perms = e.get("perms", "---")
+        if x_to_cond:
+            perms = perms.replace("x", "X")
+        bits, cond = parse_perms(perms)
+        bits = resolve_x(bits, cond, is_dir, st_mode)
+        if tag == "user":
+            key = (ACL_USER, resolve_uid(qual, False)) if qual else (ACL_USER_OBJ, None)
+        elif tag == "group":
+            key = (ACL_GROUP, resolve_gid(qual, False)) if qual else (ACL_GROUP_OBJ, None)
+        elif tag == "mask":
+            if qual:
+                raise PermError("mask ne prend pas de qualificatif")
+            mask = bits
+            continue
+        elif tag == "other":
+            if qual:
+                raise PermError("other ne prend pas de qualificatif")
+            key = (ACL_OTHER, None)
+        else:
+            raise PermError("Étiquette d'ACL invalide : %r" % (tag,))
+        acl[key] = (key[0], bits, key[1])
+    return list(acl.values()), mask
+
+
+def fill_base(acl, reference):
+    have_tags = {e[0] for e in acl}
+    for tag in (ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER):
+        if tag not in have_tags:
+            acl.append((tag, acl_get(reference, tag) or 0, None))
+    return acl
+
+
+def acl_to_ui(acl):
+    out = []
+    for tag, perm, ident in sorted(acl, key=lambda e: (e[0], e[2] or 0)):
+        name, named = TAG_NAMES.get(tag, ("?", False))
+        qual = ""
+        if named:
+            n = uid_name(ident) if tag == ACL_USER else gid_name(ident)
+            qual = n if n is not None else str(ident)
+        out.append({"tag": name, "qualifier": qual,
+                    "perms": ("r" if perm & 4 else "-") + ("w" if perm & 2 else "-") + ("x" if perm & 1 else "-")})
+    return out
+
+
+def resolve_x_acl(acl, is_dir, st_mode):
+    """Applique X sur une ACL interne dont les bits x viennent d'un modèle « dossier »."""
+    if is_dir or st_mode & 0o111:
+        return acl
+    return [(t, p & 6, i) for (t, p, i) in acl]
 
 
 # --------------------------------------------------------------------------- ZFS
 
 def zfs_filesystems():
-    out = run(["zfs", "list", "-H", "-p", "-t", "filesystem", "-o", "name,mountpoint,mounted"]).stdout
+    _c, out, _e = run(["zfs", "list", "-H", "-p", "-t", "filesystem", "-o", "name,mountpoint,mounted"])
     result = []
     for line in out.splitlines():
         parts = line.split("\t")
@@ -233,10 +449,9 @@ def zfs_filesystems():
     return result
 
 
-def dataset_for_path(path):
-    path = os.path.realpath(path)
+def dataset_for_path(path, filesystems=None):
     best = None
-    for name, mnt in zfs_filesystems():
+    for name, mnt in filesystems if filesystems is not None else zfs_filesystems():
         if path == mnt or path.startswith(mnt.rstrip("/") + "/"):
             if best is None or len(mnt) > len(best[1]):
                 best = (name, mnt)
@@ -244,7 +459,7 @@ def dataset_for_path(path):
 
 
 def zfs_props(dataset):
-    out = run(["zfs", "get", "-H", "-p", "-o", "property,value,source", ",".join(ACL_PROPS), dataset]).stdout
+    _c, out, _e = run(["zfs", "get", "-H", "-p", "-o", "property,value,source", ",".join(ACL_PROPS), dataset])
     props = {}
     for line in out.splitlines():
         parts = line.split("\t")
@@ -253,176 +468,259 @@ def zfs_props(dataset):
     return props
 
 
-def resolve_target(params, must_be_dir=False, write=False):
-    path = params.get("path")
-    if not path and params.get("dataset"):
-        props = zfs_props(params["dataset"])
-        path = props.get("mountpoint", {}).get("value")
-    if not path:
-        raise PermError("Aucun chemin ni dataset fourni")
-    path = os.path.realpath(path)
-    if not os.path.lexists(path):
-        raise PermError("Chemin introuvable : %s" % path)
-    ds = dataset_for_path(path)
-    if ds is None:
-        raise PermError("%s n'est pas dans un système de fichiers ZFS monté" % path)
-    if write:
-        if path == "/":
-            raise PermError("Refus d'agir sur /")
-        if "/.zfs/" in path + "/":
-            raise PermError("Les snapshots (.zfs) sont en lecture seule")
-    if must_be_dir and not os.path.isdir(path):
-        raise PermError("%s n'est pas un dossier" % path)
-    return path, ds[0], ds[1]
+def norm_prop(prop, value):
+    return PROP_ALIASES.get(prop, {}).get(value, value)
 
 
 def acl_mode_for(dataset):
-    """'posix', 'off' ou 'nfsv4' selon acltype."""
-    value = zfs_props(dataset).get("acltype", {}).get("value", "off")
-    if value in ("posix", "posixacl"):
+    value = norm_prop("acltype", zfs_props(dataset).get("acltype", {}).get("value", "off"))
+    if value == "posixacl":
         return "posix"
     if value == "nfsv4":
         return "nfsv4"
     return "off"
 
 
-# --------------------------------------------------------------------------- ACL POSIX
+# --------------------------------------------------------------------------- ouverture sûre
 
-ACL_LINE = re.compile(r"^(default:)?(user|group|mask|other)?:([^:]*):([rwxX-]{3})")
-
-
-def parse_getfacl(text):
-    acl = {"owner": None, "group": None, "flags": "", "access": [], "default": []}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith("# owner:"):
-            acl["owner"] = line.split(":", 1)[1].strip()
-            continue
-        if line.startswith("# group:"):
-            acl["group"] = line.split(":", 1)[1].strip()
-            continue
-        if line.startswith("# flags:"):
-            acl["flags"] = line.split(":", 1)[1].strip()
-            continue
-        if line.startswith("#"):
-            continue
-        line = line.split("#", 1)[0].strip()
-        m = ACL_LINE.match(line)
-        if not m:
-            continue
-        entry = {"tag": m.group(2), "qualifier": m.group(3), "perms": m.group(4)}
-        (acl["default"] if m.group(1) else acl["access"]).append(entry)
-    return acl
+def safe_open_child(dfd, name, want=None):
+    """Ouvre `name` relatif à `dfd` sans suivre de lien ; seulement fichier régulier
+    ou dossier ; vérifie que l'objet ouvert est celui vu par lstat.
+    Retourne (fd, fstat) ou lève OSError / PermError."""
+    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    if stat.S_ISLNK(st.st_mode):
+        raise PermError("lien symbolique refusé : %s" % name)
+    is_dir = stat.S_ISDIR(st.st_mode)
+    if not is_dir and not stat.S_ISREG(st.st_mode):
+        raise PermError("type de fichier non géré : %s" % name)
+    if want == "d" and not is_dir:
+        raise PermError("dossier attendu : %s" % name)
+    if want == "f" and is_dir:
+        raise PermError("fichier attendu : %s" % name)
+    fd = os.open(name, OPEN_DIR if is_dir else OPEN_FILE, dir_fd=dfd)
+    fst = os.fstat(fd)
+    if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+        os.close(fd)
+        raise PermError("objet modifié pendant l'opération : %s" % name)
+    return fd, fst
 
 
-def getfacl(path):
-    if not have("getfacl"):
-        raise PermError("getfacl introuvable : installer le paquet « acl »")
-    return parse_getfacl(run(["getfacl", "-p", "--absolute-names", "--", path]).stdout)
+def open_nofollow(path, want=None):
+    """Ouvre un chemin absolu composant par composant, sans jamais suivre de lien."""
+    path = os.path.normpath(path)
+    if not path.startswith("/"):
+        raise PermError("Chemin absolu attendu")
+    fd = os.open("/", OPEN_DIR)
+    if path == "/":
+        return fd, os.fstat(fd)
+    comps = path.strip("/").split("/")
+    try:
+        for i, comp in enumerate(comps):
+            last = i == len(comps) - 1
+            try:
+                nfd, nst = safe_open_child(fd, comp, want if last else "d")
+            except OSError as e:
+                raise PermError("%s : %s" % ("/" + "/".join(comps[:i + 1]), e.strerror))
+            except PermError as e:
+                raise PermError("%s : %s" % ("/" + "/".join(comps[:i + 1]), e))
+            os.close(fd)
+            fd = nfd
+        return fd, nst
+    except BaseException:
+        os.close(fd)
+        raise
 
 
-def acl_is_extended(acl):
-    if acl["default"]:
-        return True
-    return any(e["tag"] == "mask" or e["qualifier"] for e in acl["access"])
+def open_rel(root_fd, rel, root_dev=None, want=None):
+    """Ouvre `rel` (relatif, séparé par /) sous root_fd sans suivre de lien.
+    Si root_dev est fourni, refuse de sortir du système de fichiers racine."""
+    if rel in (".", ""):
+        fd = os.dup(root_fd)
+        return fd, os.fstat(fd)
+    comps = [c for c in rel.split("/") if c not in ("", ".")]
+    if ".." in comps:
+        raise PermError("chemin relatif invalide : %s" % rel)
+    fd = os.dup(root_fd)
+    try:
+        for i, comp in enumerate(comps):
+            last = i == len(comps) - 1
+            nfd, nst = safe_open_child(fd, comp, want if last else "d")
+            os.close(fd)
+            fd = nfd
+            if root_dev is not None and nst.st_dev != root_dev:
+                raise PermError("dans un autre dataset : %s" % rel)
+        return fd, nst
+    except BaseException:
+        os.close(fd)
+        raise
 
 
-def entry_spec(entry, default=False):
-    tag = entry.get("tag")
-    if tag not in ("user", "group", "mask", "other"):
-        raise PermError("Étiquette d'ACL invalide : %s" % tag)
-    qual = entry.get("qualifier") or entry.get("name") or ""
-    if tag in ("mask", "other") and qual:
-        raise PermError("%s ne prend pas de qualificatif" % tag)
-    perms = entry.get("perms", "---")
-    if not re.fullmatch(r"[rwxX-]{1,4}", perms):
-        raise PermError("Permissions invalides : %s" % perms)
-    if qual and not re.fullmatch(r"[A-Za-z0-9._@\\$-]+", qual):
-        raise PermError("Qualificatif invalide : %s" % qual)
-    return "%s%s:%s:%s" % ("default:" if default else "", tag, qual, perms)
+# --------------------------------------------------------------------------- cible
+
+class Target:
+    def __init__(self, path, dataset, mountpoint, filesystems):
+        self.path = path
+        self.dataset = dataset
+        self.mountpoint = mountpoint
+        self.fd = None
+        self.st = None
+        self.zfs_devs = set()
+        self.mount_roots = set()
+        for _n, mnt in filesystems:
+            try:
+                s = os.stat(mnt)
+                self.zfs_devs.add(s.st_dev)
+                self.mount_roots.add((s.st_dev, s.st_ino))
+            except OSError:
+                pass
+
+    def open(self):
+        self.fd, self.st = open_nofollow(self.path)
+        return self
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
-def strip_exec(perms):
-    return perms.replace("x", "-").replace("X", "-")
+def resolve_target(params, write=False, path_key="path"):
+    path = params.get(path_key)
+    if not path and params.get("dataset"):
+        path = zfs_props(params["dataset"]).get("mountpoint", {}).get("value")
+    if not path:
+        raise PermError("Aucun chemin ni dataset fourni")
+    if not os.path.isabs(path):
+        raise PermError("Chemin absolu attendu : %s" % path)
+    norm = os.path.normpath(path)
+    real = os.path.realpath(path)
+    if write and real != norm:
+        raise PermError("%s contient un lien symbolique (cible réelle : %s) : refusé en écriture" % (norm, real))
+    target_path = norm if write else real
+    if not os.path.lexists(target_path):
+        raise PermError("Chemin introuvable : %s" % target_path)
+    filesystems = zfs_filesystems()
+    ds = dataset_for_path(target_path, filesystems)
+    if ds is None:
+        raise PermError("%s n'est pas dans un système de fichiers ZFS monté" % target_path)
+    if write:
+        if target_path == "/":
+            raise PermError("Refus d'agir sur /")
+        if "/.zfs/" in target_path + "/":
+            raise PermError("Les snapshots (.zfs) sont en lecture seule")
+        if ds[1] in SYSTEM_MOUNTS and not params.get("allow_system"):
+            raise PermError("%s est dans le dataset système %s (monté sur %s) : refusé" % (target_path, ds[0], ds[1]))
+    return Target(target_path, ds[0], ds[1], filesystems)
 
 
-def build_spec(access, default, for_dir):
-    parts = [entry_spec(e) for e in access]
-    if for_dir:
-        parts += [entry_spec(e, True) for e in default]
-    return ",".join(parts)
+# --------------------------------------------------------------------------- parcours par descripteurs
+
+class Entry:
+    __slots__ = ("path", "rel", "fd", "st", "is_dir")
+
+    def __init__(self, path, rel, fd, st):
+        self.path = path
+        self.rel = rel
+        self.fd = fd
+        self.st = st
+        self.is_dir = stat.S_ISDIR(st.st_mode)
 
 
-def chunks(seq, n=CHUNK):
-    for i in range(0, len(seq), n):
-        yield seq[i:i + n]
+def _race_hook(rel, root_path):
+    """Hook de test : COCKPIT_ZFS_PERM_TEST_RACE='{"trigger": rel, "swap": rel, "target": chemin}'
+    remplace un dossier par un lien symbolique juste avant l'ouverture de `trigger`."""
+    spec = os.environ.get("COCKPIT_ZFS_PERM_TEST_RACE")
+    if not spec:
+        return
+    cfg = json.loads(spec)
+    if cfg.get("done") or cfg.get("trigger") != rel:
+        return
+    victim = os.path.join(root_path, cfg["swap"])
+    os.rename(victim, victim + ".orig")
+    os.symlink(cfg["target"], victim)
+    cfg["done"] = True
+    os.environ["COCKPIT_ZFS_PERM_TEST_RACE"] = json.dumps(cfg)
 
 
-# --------------------------------------------------------------------------- parcours
-
-def walk(root, params):
-    """Génère (chemin, lstat) en respectant les filtres. Ne suit jamais les liens
-    symboliques et ne traverse pas les datasets enfants sauf demande explicite."""
+def walk(target, params, errors=None):
+    """Génère des Entry ouvertes (fd valide pendant le traitement de l'élément).
+    Ne suit jamais les liens, n'ouvre que fichiers réguliers et dossiers, ne
+    traverse pas les datasets enfants sauf cross_datasets (et jamais les
+    montages non ZFS), ignore .zfs à la racine de chaque dataset."""
     cross = bool(params.get("cross_datasets", False))
     max_depth = params.get("max_depth")
     max_depth = int(max_depth) if max_depth not in (None, "") else None
     include = [p for p in params.get("include", []) if p]
     exclude = [p for p in params.get("exclude", []) if p]
-    types = params.get("types", "all")  # all | files | dirs
+    types = params.get("types", "all")
     recursive = params.get("recursive", True)
     include_root = params.get("include_root", True)
+    root = target.path
+    root_st = target.st
 
-    root_st = os.lstat(root)
-    root_dev = root_st.st_dev
+    def matches(rel, patterns):
+        name = os.path.basename(rel)
+        return any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(name, p) for p in patterns)
 
-    def accept(rel, st):
-        if stat.S_ISLNK(st.st_mode):
-            return False
-        is_dir = stat.S_ISDIR(st.st_mode)
+    def accept(rel, is_dir):
         if types == "files" and is_dir:
             return False
         if types == "dirs" and not is_dir:
             return False
-        name = os.path.basename(rel)
-        if exclude and any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(name, p) for p in exclude):
-            return False
-        if include and not any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(name, p) for p in include):
+        if include and not matches(rel, include):
             return False
         return True
 
-    if include_root and accept(".", root_st):
-        yield root, root_st
+    def err(path, e):
+        if errors is not None:
+            errors(path, e)
+
+    if include_root and accept(".", stat.S_ISDIR(root_st.st_mode)):
+        yield Entry(root, ".", target.fd, root_st)
     if not recursive or not stat.S_ISDIR(root_st.st_mode):
         return
 
-    stack = [(root, 0)]
-    while stack:
-        current, depth = stack.pop()
+    def visit(dfd, dst, drel, depth):
         if max_depth is not None and depth >= max_depth:
-            continue
+            return
         try:
-            entries = list(os.scandir(current))
-        except OSError:
-            continue
-        for de in entries:
-            if de.name == ".zfs" and current == root:
+            names = sorted(os.listdir(dfd))
+        except OSError as e:
+            err(root if drel == "." else os.path.join(root, drel), e)
+            return
+        is_mount_root = (dst.st_dev, dst.st_ino) in target.mount_roots
+        for name in names:
+            rel = name if drel == "." else drel + "/" + name
+            path = os.path.join(root, rel)
+            if name == ".zfs" and is_mount_root:
                 continue
             try:
-                st = de.stat(follow_symlinks=False)
-            except OSError:
+                lst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except OSError as e:
+                err(path, e)
                 continue
-            rel = os.path.relpath(de.path, root)
-            if exclude and stat.S_ISDIR(st.st_mode) and any(
-                    fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(de.name, p) for p in exclude):
-                continue  # élague le sous-arbre exclu
-            if stat.S_ISDIR(st.st_mode):
-                if st.st_dev != root_dev and not cross:
-                    continue  # dataset enfant ou autre montage
-                stack.append((de.path, depth + 1))
-            if accept(rel, st):
-                yield de.path, st
+            if not (stat.S_ISDIR(lst.st_mode) or stat.S_ISREG(lst.st_mode)):
+                continue  # liens, périphériques, FIFO, sockets : jamais ouverts
+            is_dir = stat.S_ISDIR(lst.st_mode)
+            if lst.st_dev != dst.st_dev and (not cross or lst.st_dev not in target.zfs_devs):
+                continue  # dataset enfant (ou autre montage)
+            if exclude and matches(rel, exclude):
+                continue
+            _race_hook(rel, root)
+            try:
+                fd, fst = safe_open_child(dfd, name)
+            except (OSError, PermError) as e:
+                err(path, e)
+                continue
+            try:
+                if accept(rel, is_dir):
+                    yield Entry(path, rel, fd, fst)
+                if is_dir and stat.S_ISDIR(fst.st_mode):
+                    yield from visit(fd, fst, rel, depth + 1)
+            finally:
+                os.close(fd)
+
+    yield from visit(target.fd, root_st, ".", 0)
 
 
 # --------------------------------------------------------------------------- sauvegardes
@@ -431,33 +729,56 @@ def ensure_backup_dir():
     os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
 
 
-def create_backup(path, dataset, reason):
-    if not have("getfacl"):
-        raise PermError("getfacl introuvable : impossible de sauvegarder (paquet « acl »)")
-    ensure_backup_dir()
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    safe = dataset.replace("/", "_")
-    backup_id = "%s-%s" % (safe, stamp)
-    base = os.path.join(BACKUP_DIR, backup_id)
-    proc = subprocess.run(
-        ["getfacl", "-R", "-P", "-p", "--absolute-names", "--", path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0 and not proc.stdout:
-        raise PermError("getfacl -R a échoué : %s" % proc.stderr.decode(errors="replace").strip())
-    with gzip.open(base + ".facl.gz", "wb") as f:
-        f.write(proc.stdout)
-    entries = proc.stdout.count(b"# file: ")
-    meta = {
-        "id": backup_id, "path": path, "dataset": dataset, "reason": reason,
-        "created": int(time.time()), "entries": entries,
-        "size": os.path.getsize(base + ".facl.gz"),
+def snapshot_state(fd, st):
+    flags = get_fsflags_fd(fd)
+    return {
+        "t": "d" if stat.S_ISDIR(st.st_mode) else "f",
+        "u": st.st_uid, "g": st.st_gid, "m": stat.S_IMODE(st.st_mode),
+        "a": b64(fd_getxattr(fd, ACCESS_XATTR)),
+        "d": b64(fd_getxattr(fd, DEFAULT_XATTR)) if stat.S_ISDIR(st.st_mode) else None,
+        "x": {NTACL_XATTR: b64(fd_getxattr(fd, NTACL_XATTR)), DOSATTRIB_XATTR: b64(fd_getxattr(fd, DOSATTRIB_XATTR))},
+        "f": (flags or 0) & PROTECT_FLAGS,
     }
-    with open(base + ".json", "w") as f:
-        json.dump(meta, f)
-    os.chmod(base + ".facl.gz", 0o600)
-    os.chmod(base + ".json", 0o600)
-    return meta
+
+
+class Backup:
+    """Sauvegarde au fil du parcours : l'état de chaque objet est écrit avant sa
+    modification (propriétaire, mode, ACL brutes, ACL NT, DOSATTRIB, immutable)."""
+
+    def __init__(self, target, reason, params):
+        ensure_backup_dir()
+        safe = target.dataset.replace("/", "_")
+        stamp = time.strftime("%Y%m%d-%H%M%S") + "-%06d" % (int(time.time() * 1e6) % 1000000)
+        backup_id = "%s-%s" % (safe, stamp)
+        n = 1
+        while os.path.exists(os.path.join(BACKUP_DIR, backup_id + ".json")):
+            n += 1
+            backup_id = "%s-%s-%d" % (safe, stamp, n)
+        self.id = backup_id
+        self.base = os.path.join(BACKUP_DIR, backup_id)
+        fd = os.open(self.base + ".perm.jsonl.gz", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        self.f = gzip.open(os.fdopen(fd, "wb"), "wb")
+        self.count = 0
+        self.meta = {
+            "id": backup_id, "format": 2, "path": target.path, "dataset": target.dataset,
+            "reason": reason, "created": int(time.time()), "entries": 0,
+            "options": {k: params.get(k) for k in ("recursive", "include_root", "cross_datasets", "max_depth", "include", "exclude", "types")},
+        }
+
+    def record(self, e):
+        rec = snapshot_state(e.fd, e.st)
+        rec["r"] = b64(os.fsencode(e.rel))
+        self.f.write((json.dumps(rec) + "\n").encode("ascii"))
+        self.count += 1
+
+    def close(self):
+        self.f.close()
+        self.meta["entries"] = self.count
+        self.meta["size"] = os.path.getsize(self.base + ".perm.jsonl.gz")
+        fd = os.open(self.base + ".json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.meta, f, ensure_ascii=True)
+        return self.meta
 
 
 def list_backups(_params):
@@ -468,7 +789,9 @@ def list_backups(_params):
         if name.endswith(".json"):
             try:
                 with open(os.path.join(BACKUP_DIR, name)) as f:
-                    out.append(json.load(f))
+                    meta = json.load(f)
+                if meta.get("format") == 2:
+                    out.append(meta)
             except (OSError, ValueError):
                 pass
     return {"backups": out}
@@ -478,16 +801,15 @@ def backup_files(backup_id):
     if not re.fullmatch(r"[A-Za-z0-9._-]+", backup_id or ""):
         raise PermError("Identifiant de sauvegarde invalide")
     base = os.path.join(BACKUP_DIR, backup_id)
-    if not os.path.exists(base + ".facl.gz"):
+    if not os.path.exists(base + ".perm.jsonl.gz") or not os.path.exists(base + ".json"):
         raise PermError("Sauvegarde introuvable : %s" % backup_id)
-    return base + ".facl.gz", base + ".json"
+    return base + ".perm.jsonl.gz", base + ".json"
 
 
 def delete_backup(params):
     data, meta = backup_files(params.get("id"))
     os.unlink(data)
-    if os.path.exists(meta):
-        os.unlink(meta)
+    os.unlink(meta)
     return {"deleted": params.get("id")}
 
 
@@ -497,7 +819,8 @@ def describe(path, st=None):
     st = st or os.lstat(path)
     info = {
         "path": path,
-        "type": "dir" if stat.S_ISDIR(st.st_mode) else "link" if stat.S_ISLNK(st.st_mode) else "file",
+        "type": "dir" if stat.S_ISDIR(st.st_mode) else "link" if stat.S_ISLNK(st.st_mode)
+        else "file" if stat.S_ISREG(st.st_mode) else "other",
         "mode": mode_str(st.st_mode),
         "symbolic": stat.filemode(st.st_mode),
         "uid": st.st_uid, "owner": uid_name(st.st_uid),
@@ -505,29 +828,61 @@ def describe(path, st=None):
         "setgid": bool(st.st_mode & stat.S_ISGID),
         "sticky": bool(st.st_mode & stat.S_ISVTX),
     }
-    x = list_xattrs(path)
+    try:
+        x = os.listxattr(path, follow_symlinks=False)
+    except OSError:
+        x = []
     info["xattrs"] = x
     info["has_ntacl"] = NTACL_XATTR in x
-    info["has_posix_acl"] = POSIX_ACCESS_XATTR in x or POSIX_DEFAULT_XATTR in x
-    flags = get_fsflags(path) if not stat.S_ISLNK(st.st_mode) else None
+    info["has_posix_acl"] = ACCESS_XATTR in x or DEFAULT_XATTR in x
+    flags = None
+    if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
+        try:
+            fd = os.open(path, OPEN_DIR if stat.S_ISDIR(st.st_mode) else OPEN_FILE)
+            try:
+                if (os.fstat(fd).st_ino == st.st_ino):
+                    flags = get_fsflags_fd(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
     info["immutable"] = bool(flags and flags & FS_IMMUTABLE_FL)
     info["append_only"] = bool(flags and flags & FS_APPEND_FL)
     return info
 
 
+def acl_for_path(path, st):
+    def get(name):
+        try:
+            return os.getxattr(path, name, follow_symlinks=False)
+        except OSError:
+            return None
+    raw_a = get(ACCESS_XATTR)
+    raw_d = get(DEFAULT_XATTR) if stat.S_ISDIR(st.st_mode) else None
+    m = st.st_mode
+    return {
+        "owner": uid_name(st.st_uid) or str(st.st_uid),
+        "group": gid_name(st.st_gid) or str(st.st_gid),
+        "flags": ("s" if m & stat.S_ISUID else "-") + ("s" if m & stat.S_ISGID else "-") + ("t" if m & stat.S_ISVTX else "-"),
+        "access": acl_to_ui(decode_acl(raw_a) if raw_a else base_from_mode(m)),
+        "default": acl_to_ui(decode_acl(raw_d)) if raw_d else [],
+    }
+
+
 def cmd_inspect(params):
-    path, dataset, mountpoint = resolve_target(params)
-    props = zfs_props(dataset)
-    info = describe(path)
-    acl = None
-    acl_error = None
+    target = resolve_target(params)
+    path = target.path
+    props = zfs_props(target.dataset)
+    st = os.lstat(path)
+    info = describe(path, st)
+    acl, acl_error = None, None
     try:
-        acl = getfacl(path)
+        acl = acl_for_path(path, st)
     except PermError as e:
         acl_error = str(e)
     children = []
     limit = int(params.get("children_limit", 300))
-    if os.path.isdir(path) and not os.path.islink(path):
+    if stat.S_ISDIR(st.st_mode):
         try:
             for de in sorted(os.scandir(path), key=lambda d: d.name)[:limit]:
                 if de.name == ".zfs":
@@ -539,11 +894,11 @@ def cmd_inspect(params):
         except OSError:
             pass
     warnings = []
-    acltype = props.get("acltype", {}).get("value")
+    acltype = norm_prop("acltype", props.get("acltype", {}).get("value"))
     xattr = props.get("xattr", {}).get("value")
-    if acltype in ("posix", "posixacl") and xattr not in ("sa",):
+    if acltype == "posixacl" and xattr != "sa":
         warnings.append("acltype=posixacl avec xattr=%s : chaque ACL devient un fichier caché, préférez xattr=sa" % xattr)
-    if acltype in ("posix", "posixacl"):
+    if acltype == "posixacl":
         for p in ("aclinherit", "aclmode"):
             if props.get(p, {}).get("source") == "local":
                 warnings.append("%s n'a aucun effet avec des ACL POSIX sous Linux (s'applique aux ACL NFSv4)" % p)
@@ -551,95 +906,102 @@ def cmd_inspect(params):
         warnings.append("Des ACL POSIX sont stockées mais ignorées (acltype=off)")
     if info["has_ntacl"]:
         warnings.append("ACL NT présente (security.NTACL) : Samba / ksmbd avec acl_xattr l'affiche au client Windows")
+    if os.path.realpath(params.get("path") or path) != os.path.normpath(params.get("path") or path):
+        warnings.append("Le chemin demandé contient un lien symbolique : affichage de la cible réelle %s, écriture refusée" % path)
+    if target.mountpoint in SYSTEM_MOUNTS:
+        warnings.append("Dataset système (monté sur %s) : les modifications sont refusées" % target.mountpoint)
     return {
-        "path": path, "dataset": dataset, "mountpoint": mountpoint,
+        "path": path, "dataset": target.dataset, "mountpoint": target.mountpoint,
         "props": props, "info": info, "acl": acl, "acl_error": acl_error,
         "children": children, "warnings": warnings,
-        "acl_mode": acl_mode_for(dataset),
+        "acl_mode": acl_mode_for(target.dataset),
     }
 
 
 def cmd_audit(params):
-    path, dataset, _m = resolve_target(params)
-    max_entries = int(params.get("max_entries", 2000000))
-    root_st = os.lstat(path)
-    root_setgid = bool(root_st.st_mode & stat.S_ISGID)
-    acltype = acl_mode_for(dataset)
-    findings = {k: [] for k in (
-        "world_writable", "orphan_uid", "orphan_gid", "ntacl", "posix_acl",
-        "ignored_posix_acl", "dir_missing_setgid", "foreign_group", "immutable",
-        "setuid",
-    )}
-    counts = {k: 0 for k in findings}
-    owners, groups, modes = {}, {}, {}
-    total = files = dirs = 0
-    truncated = False
-    check_flags = bool(params.get("check_flags", True))
+    target = resolve_target(params).open()
+    try:
+        max_entries = int(params.get("max_entries", 2000000))
+        root_st = target.st
+        root_setgid = bool(root_st.st_mode & stat.S_ISGID)
+        acltype = acl_mode_for(target.dataset)
+        kinds = ("world_writable", "orphan_uid", "orphan_gid", "ntacl", "posix_acl", "ignored_posix_acl",
+                 "dir_missing_setgid", "foreign_group", "immutable", "setuid")
+        findings = {k: [] for k in kinds}
+        counts = {k: 0 for k in kinds}
+        owners, groups, modes = {}, {}, {}
+        total = files = dirs = 0
+        truncated = False
+        check_flags = bool(params.get("check_flags", True))
 
-    def add(kind, p):
-        counts[kind] += 1
-        if len(findings[kind]) < FINDING_LIMIT:
-            findings[kind].append(p)
+        def add(kind, p):
+            counts[kind] += 1
+            if len(findings[kind]) < FINDING_LIMIT:
+                findings[kind].append(p)
 
-    for p, st in walk(path, dict(params, types="all")):
-        total += 1
-        if total > max_entries:
-            truncated = True
-            break
-        is_dir = stat.S_ISDIR(st.st_mode)
-        dirs += is_dir
-        files += not is_dir
-        owners[st.st_uid] = owners.get(st.st_uid, 0) + 1
-        groups[st.st_gid] = groups.get(st.st_gid, 0) + 1
-        m = mode_str(st.st_mode) + ("d" if is_dir else "f")
-        modes[m] = modes.get(m, 0) + 1
-        if st.st_mode & stat.S_IWOTH and not (is_dir and st.st_mode & stat.S_ISVTX):
-            add("world_writable", p)
-        if uid_name(st.st_uid) is None:
-            add("orphan_uid", p)
-        if gid_name(st.st_gid) is None:
-            add("orphan_gid", p)
-        if st.st_gid != root_st.st_gid:
-            add("foreign_group", p)
-        if is_dir and root_setgid and not st.st_mode & stat.S_ISGID:
-            add("dir_missing_setgid", p)
-        if not is_dir and st.st_mode & (stat.S_ISUID | stat.S_ISGID):
-            add("setuid", p)
-        x = list_xattrs(p)
-        if NTACL_XATTR in x:
-            add("ntacl", p)
-        if POSIX_ACCESS_XATTR in x or POSIX_DEFAULT_XATTR in x:
-            add("ignored_posix_acl" if acltype == "off" else "posix_acl", p)
-        if check_flags:
-            fl = get_fsflags(p)
-            if fl and fl & (FS_IMMUTABLE_FL | FS_APPEND_FL):
-                add("immutable", p)
+        for e in walk(target, dict(params, types="all")):
+            total += 1
+            if total > max_entries:
+                truncated = True
+                break
+            st = e.st
+            dirs += e.is_dir
+            files += not e.is_dir
+            owners[st.st_uid] = owners.get(st.st_uid, 0) + 1
+            groups[st.st_gid] = groups.get(st.st_gid, 0) + 1
+            m = mode_str(st.st_mode) + ("d" if e.is_dir else "f")
+            modes[m] = modes.get(m, 0) + 1
+            if st.st_mode & stat.S_IWOTH and not (e.is_dir and st.st_mode & stat.S_ISVTX):
+                add("world_writable", e.path)
+            if uid_name(st.st_uid) is None:
+                add("orphan_uid", e.path)
+            if gid_name(st.st_gid) is None:
+                add("orphan_gid", e.path)
+            if st.st_gid != root_st.st_gid:
+                add("foreign_group", e.path)
+            if e.is_dir and root_setgid and not st.st_mode & stat.S_ISGID:
+                add("dir_missing_setgid", e.path)
+            if not e.is_dir and st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                add("setuid", e.path)
+            try:
+                x = os.listxattr(e.fd)
+            except OSError:
+                x = []
+            if NTACL_XATTR in x:
+                add("ntacl", e.path)
+            if ACCESS_XATTR in x or DEFAULT_XATTR in x:
+                add("ignored_posix_acl" if acltype == "off" else "posix_acl", e.path)
+            if check_flags:
+                fl = get_fsflags_fd(e.fd)
+                if fl and fl & PROTECT_FLAGS:
+                    add("immutable", e.path)
 
-    def top(d, namer):
-        return [{"id": k, "name": namer(k), "count": v}
-                for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:15]]
+        def top(d, namer):
+            return [{"id": k, "name": namer(k), "count": v}
+                    for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:15]]
 
-    return {
-        "path": path, "dataset": dataset, "acl_mode": acltype,
-        "total": total, "files": files, "dirs": dirs, "truncated": truncated,
-        "counts": counts, "findings": findings,
-        "owners": top(owners, uid_name), "groups": top(groups, gid_name),
-        "modes": [{"mode": k[:-1], "kind": "dossier" if k[-1] == "d" else "fichier", "count": v}
-                  for k, v in sorted(modes.items(), key=lambda kv: -kv[1])[:20]],
-    }
+        return {
+            "path": target.path, "dataset": target.dataset, "acl_mode": acltype,
+            "total": total, "files": files, "dirs": dirs, "truncated": truncated,
+            "counts": counts, "findings": findings,
+            "owners": top(owners, uid_name), "groups": top(groups, gid_name),
+            "modes": [{"mode": k[:-1], "kind": "dossier" if k[-1] == "d" else "fichier", "count": v}
+                      for k, v in sorted(modes.items(), key=lambda kv: -kv[1])[:20]],
+        }
+    finally:
+        target.close()
 
 
 # --------------------------------------------------------------------------- application
 
 class Plan:
-    """Accumule les opérations ; exécute seulement si dry_run est faux."""
-
     def __init__(self, dry_run):
         self.dry_run = dry_run
         self.count = 0
         self.sample = []
         self.commands = []
         self.errors = []
+        self.error_count = 0
 
     def note(self, path, what):
         self.count += 1
@@ -651,107 +1013,149 @@ class Plan:
             self.commands.append(desc)
 
     def error(self, path, err):
+        self.error_count += 1
         if len(self.errors) < FINDING_LIMIT:
-            self.errors.append({"path": path, "error": str(err)})
+            self.errors.append({"path": path, "error": getattr(err, "strerror", None) or str(err)})
 
     def result(self, **extra):
         r = {"dry_run": self.dry_run, "count": self.count, "sample": self.sample,
-             "commands": self.commands, "errors": self.errors, "error_count": len(self.errors)}
+             "commands": self.commands, "errors": self.errors, "error_count": self.error_count}
         r.update(extra)
         return r
-
-
-def setfacl_batch(plan, args, paths):
-    if not paths:
-        return
-    plan.command("setfacl %s -- <%d chemins>" % (" ".join(args), len(paths)))
-    if plan.dry_run:
-        return
-    for group in chunks(paths):
-        proc = run(["setfacl"] + args + ["--"] + group, check=False)
-        if proc.returncode != 0:
-            for line in proc.stderr.strip().splitlines()[:20]:
-                plan.error(group[0], line)
 
 
 def require_posix(dataset, what):
     mode = acl_mode_for(dataset)
     if mode != "posix":
         raise PermError("%s exige acltype=posixacl sur %s (actuel : %s)" % (what, dataset, mode))
-    if not have("setfacl"):
-        raise PermError("setfacl introuvable : installer le paquet « acl »")
 
 
-def apply_owner_mode(plan, p, st, uid, gid, mode):
-    changes = []
-    if (uid != -1 and st.st_uid != uid) or (gid != -1 and st.st_gid != gid):
-        changes.append("propriétaire %s:%s → %s:%s" % (
-            uid_name(st.st_uid) or st.st_uid, gid_name(st.st_gid) or st.st_gid,
-            (uid_name(uid) or uid) if uid != -1 else "=", (gid_name(gid) or gid) if gid != -1 else "="))
-    if mode is not None and stat.S_IMODE(st.st_mode) != mode:
-        changes.append("mode %s → %04o" % (mode_str(st.st_mode), mode))
-    if not changes:
-        return
-    plan.note(p, ", ".join(changes))
-    if plan.dry_run:
-        return
-    try:
-        if uid != -1 or gid != -1:
-            os.chown(p, uid, gid, follow_symlinks=False)
-        if mode is not None:
-            # chown efface setuid/setgid : on applique le mode après
-            os.chmod(p, mode)
-    except OSError as e:
-        plan.error(p, e)
+def owner_change_desc(st, uid, gid):
+    if (uid == -1 or st.st_uid == uid) and (gid == -1 or st.st_gid == gid):
+        return None
+    return "propriétaire %s:%s → %s:%s" % (
+        uid_name(st.st_uid) or st.st_uid, gid_name(st.st_gid) or st.st_gid,
+        (uid_name(uid) or uid) if uid != -1 else "=", (gid_name(gid) or gid) if gid != -1 else "=")
+
+
+def chown_keep_setid(fd, st, uid, gid):
+    """fchown puis réapplique setuid / setgid que le noyau retire au chown."""
+    if (uid == -1 or st.st_uid == uid) and (gid == -1 or st.st_gid == gid):
+        return False
+    os.fchown(fd, uid, gid)
+    if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+        cur = os.fstat(fd).st_mode
+        if stat.S_IMODE(cur) != stat.S_IMODE(st.st_mode):
+            os.fchmod(fd, stat.S_IMODE(cur) | (stat.S_IMODE(st.st_mode) & (stat.S_ISUID | stat.S_ISGID)))
+    return True
+
+
+def drive(target, params, plan, backup, fn):
+    """Parcourt la cible et applique fn(entry) ; la sauvegarde de chaque objet
+    est écrite avant sa modification."""
+    for e in walk(target, params, errors=plan.error):
+        try:
+            if backup is not None:
+                backup.record(e)
+            fn(e)
+        except PermError as err:
+            plan.error(e.path, err)
+        except OSError as err:
+            plan.error(e.path, err)
+
+
+def begin(params, method, write=True):
+    target = resolve_target(params, write=write).open()
+    plan = Plan(params.get("dry_run", True))
+    backup = None
+    if not plan.dry_run and params.get("backup", True) and method != "from-backup":
+        backup = Backup(target, "avant %s" % method, params)
+    return target, plan, backup
+
+
+def finish(target, plan, backup, **extra):
+    meta = backup.close() if backup is not None else None
+    target.close()
+    return plan.result(path=target.path, dataset=target.dataset, backup=meta, **extra)
 
 
 def cmd_set_acl(params):
-    path, dataset, _m = resolve_target(params, write=True)
-    require_posix(dataset, "L'édition d'ACL")
-    action = params.get("action", "modify")  # set | modify | remove | remove-default
-    access = params.get("access", [])
-    default = params.get("default", [])
-    plan = Plan(params.get("dry_run", True))
-    files, dirs = [], []
-    for p, st in walk(path, dict(params, recursive=params.get("recursive", False))):
-        (dirs if stat.S_ISDIR(st.st_mode) else files).append(p)
-    if action == "remove-default":
-        setfacl_batch(plan, ["-k"], dirs)
-        for p in dirs:
-            plan.note(p, "ACL par défaut retirée")
-        return plan.result()
+    action = params.get("action", "modify")
+    if action not in ("set", "modify", "remove", "remove-default"):
+        raise PermError("Action inconnue : %s" % action)
+    target = resolve_target(params, write=True)
+    require_posix(target.dataset, "L'édition d'ACL")
+    params = dict(params, recursive=params.get("recursive", False))
+    access_ui = params.get("access", [])
+    default_ui = params.get("default", [])
+    cond_x = params.get("files_conditional_x", True)
+
+    # validation complète avant toute écriture
+    removals = []
     if action == "remove":
-        def rm_spec(entries, d=False):
-            return ",".join("%s%s:%s" % ("default:" if d else "", e["tag"], e.get("qualifier") or "")
-                            for e in entries if e.get("qualifier"))
-        fspec = rm_spec(access)
-        dspec = ",".join(s for s in (rm_spec(access), rm_spec(default, True)) if s)
-        if fspec:
-            setfacl_batch(plan, ["-x", fspec], files)
-        if dspec:
-            setfacl_batch(plan, ["-x", dspec], dirs)
-    else:
-        flag = "--set" if action == "set" else "-m"
-        # files_conditional_x : sur les fichiers, x devient X (exécutable seulement
-        # s'il l'est déjà pour une classe), comme le ferait l'héritage Windows.
-        if params.get("files_conditional_x", True):
-            file_access = [dict(e, perms=e["perms"].replace("x", "X")) for e in access]
+        for e in access_ui + default_ui:
+            if e.get("tag") not in ("user", "group") or not e.get("qualifier"):
+                continue
+            ident = resolve_uid(e["qualifier"], False) if e["tag"] == "user" else resolve_gid(e["qualifier"], False)
+            removals.append((ACL_USER if e["tag"] == "user" else ACL_GROUP, ident))
+        if not removals:
+            raise PermError("Aucune entrée nommée à retirer")
+    elif action in ("set", "modify"):
+        ui_entries_to_acl(access_ui, True, 0)
+        ui_entries_to_acl(default_ui, True, 0)
+
+    target.open()
+    plan = Plan(params.get("dry_run", True))
+    backup = Backup(target, "avant set-acl %s" % action, params) \
+        if not plan.dry_run and params.get("backup", True) else None
+
+    def apply(e):
+        if action == "remove-default":
+            if e.is_dir and fd_getxattr(e.fd, DEFAULT_XATTR) is not None:
+                plan.note(e.path, "ACL par défaut retirée")
+                if not plan.dry_run:
+                    fd_removexattr(e.fd, DEFAULT_XATTR)
+            return
+        cur_a = read_access(e.fd, e.st)
+        cur_d = read_default(e.fd) if e.is_dir else []
+        if action == "remove":
+            new_a = with_mask([x for x in cur_a if (x[0], x[2]) not in removals])
+            new_d = with_mask([x for x in cur_d if (x[0], x[2]) not in removals]) if cur_d else []
         else:
-            file_access = access
-        fspec = build_spec(file_access, [], False)
-        dspec = build_spec(access, default, True)
-        if fspec:
-            setfacl_batch(plan, [flag, fspec], files)
-        if dspec:
-            setfacl_batch(plan, [flag, dspec], dirs)
-    for p in dirs + files:
-        plan.note(p, "ACL %s" % action)
-    return plan.result()
+            given_a, mask_a = ui_entries_to_acl(access_ui, e.is_dir, e.st.st_mode, x_to_cond=cond_x and not e.is_dir)
+            given_d, mask_d = ui_entries_to_acl(default_ui, True, 0) if e.is_dir else ([], None)
+            if action == "set":
+                new_a = with_mask(fill_base(given_a, cur_a), mask_a)
+                new_d = with_mask(fill_base(given_d, cur_a), mask_d) if given_d else cur_d
+            else:
+                merged = {(x[0], x[2]): x for x in cur_a if x[0] != ACL_MASK}
+                merged.update({(x[0], x[2]): x for x in given_a})
+                new_a = with_mask(list(merged.values()), mask_a)
+                if given_d:
+                    base_d = cur_d or [x for x in cur_a if x[0] in (ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER)]
+                    md = {(x[0], x[2]): x for x in base_d if x[0] != ACL_MASK}
+                    md.update({(x[0], x[2]): x for x in given_d})
+                    new_d = with_mask(list(md.values()), mask_d)
+                else:
+                    new_d = cur_d
+        changed = sorted(new_a) != sorted(cur_a) or (e.is_dir and sorted(new_d) != sorted(cur_d))
+        if not changed:
+            return
+        plan.note(e.path, "ACL %s" % action)
+        if plan.dry_run:
+            return
+        write_access(e.fd, new_a)
+        if e.is_dir and sorted(new_d) != sorted(cur_d):
+            write_default(e.fd, new_d)
+
+    plan.command("ACL écrites par descripteur (xattr system.posix_acl_*)")
+    drive(target, params, plan, backup, apply)
+    return finish(target, plan, backup)
 
 
 # --------------------------------------------------------------------------- reset
 
-def reset_unix_mode(params, path, dataset, plan):
+def reset_unix_mode(params, target, plan, backup):
     uid = resolve_uid(params.get("owner"))
     gid = resolve_gid(params.get("group"))
     fmode = parse_mode(params.get("file_mode"), "Mode fichiers")
@@ -761,62 +1165,62 @@ def reset_unix_mode(params, path, dataset, plan):
     if params.get("sticky_dirs") and dmode is not None:
         dmode |= stat.S_ISVTX
     keep_exec = params.get("keep_exec", False)
-    strip = params.get("strip_acl", True) and acl_mode_for(dataset) == "posix" and have("setfacl")
-    with_acl = []
-    for p, st in walk(path, params):
-        is_dir = stat.S_ISDIR(st.st_mode)
-        mode = dmode if is_dir else fmode
-        if mode is not None and not is_dir and keep_exec and st.st_mode & stat.S_IXUSR:
-            mode |= (mode & 0o444) >> 2  # r → x pour chaque classe qui lit
-        apply_owner_mode(plan, p, st, uid, gid, mode)
-        if strip:
-            x = list_xattrs(p)
-            if POSIX_ACCESS_XATTR in x or POSIX_DEFAULT_XATTR in x:
-                with_acl.append(p)
-    if with_acl:
-        for p in with_acl[:SAMPLE_LIMIT]:
-            plan.note(p, "ACL étendues retirées")
-        plan.count += max(0, len(with_acl) - SAMPLE_LIMIT)
-        # setfacl -b recalcule le mode : on le passe avant le chmod final
-        setfacl_batch(plan, ["-b"], with_acl)
-        if not plan.dry_run:
-            for p in with_acl:
-                try:
-                    st = os.lstat(p)
-                    mode = dmode if stat.S_ISDIR(st.st_mode) else fmode
-                    if mode is not None:
-                        os.chmod(p, mode)
-                except OSError as e:
-                    plan.error(p, e)
+    strip = params.get("strip_acl", True) and acl_mode_for(target.dataset) == "posix"
+
+    def apply(e):
+        st = e.st
+        mode = dmode if e.is_dir else fmode
+        if mode is not None and not e.is_dir and keep_exec and st.st_mode & stat.S_IXUSR:
+            mode |= (mode & 0o444) >> 2
+        has_acl = strip and (fd_getxattr(e.fd, ACCESS_XATTR) is not None or
+                             (e.is_dir and fd_getxattr(e.fd, DEFAULT_XATTR) is not None))
+        changes = []
+        oc = owner_change_desc(st, uid, gid)
+        if oc:
+            changes.append(oc)
+        if mode is not None and stat.S_IMODE(st.st_mode) != mode:
+            changes.append("mode %s → %04o" % (mode_str(st.st_mode), mode))
+        if has_acl:
+            changes.append("ACL étendues retirées")
+        if not changes:
+            return
+        plan.note(e.path, ", ".join(changes))
+        if plan.dry_run:
+            return
+        if has_acl:
+            strip_access(e.fd, st)
+            if e.is_dir:
+                fd_removexattr(e.fd, DEFAULT_XATTR)
+        if uid != -1 or gid != -1:
+            if mode is None:
+                chown_keep_setid(e.fd, os.fstat(e.fd), uid, gid)
+            else:
+                os.fchown(e.fd, uid, gid)
+        if mode is not None:
+            os.fchmod(e.fd, mode)
+
+    drive(target, params, plan, backup, apply)
 
 
-def reset_strip_acl(params, path, dataset, plan):
-    require_posix(dataset, "Le retrait d'ACL")
+def reset_strip_acl(params, target, plan, backup):
+    require_posix(target.dataset, "Le retrait d'ACL")
     keep_default = params.get("keep_default", False)
-    targets = []
-    for p, st in walk(path, params):
-        x = list_xattrs(p)
-        if POSIX_ACCESS_XATTR in x or (POSIX_DEFAULT_XATTR in x and not keep_default):
-            targets.append(p)
-            plan.note(p, "ACL d'accès retirée" if keep_default else "ACL d'accès + par défaut retirées")
-    if keep_default:
-        # retire l'ACL d'accès étendue seulement : --set avec les entrées de base
-        plan.command("setfacl --remove-all sauf default (par fichier)")
-        if not plan.dry_run:
-            for p in targets:
-                try:
-                    st = os.lstat(p)
-                    m = stat.S_IMODE(st.st_mode)
-                    base = "u::%s,g::%s,o::%s" % tuple(
-                        "".join(c if m & b else "-" for c, b in zip("rwx", bits))
-                        for bits in ((0o400, 0o200, 0o100), (0o40, 0o20, 0o10), (0o4, 0o2, 0o1)))
-                    defaults = getfacl(p)["default"] if os.path.isdir(p) else []
-                    spec = base + ("," + build_spec([], defaults, True) if defaults else "")
-                    run(["setfacl", "--set", spec, "--", p])
-                except (OSError, PermError) as e:
-                    plan.error(p, e)
-    else:
-        setfacl_batch(plan, ["-b"], targets)
+
+    def apply(e):
+        has_a = fd_getxattr(e.fd, ACCESS_XATTR) is not None
+        has_d = e.is_dir and not keep_default and fd_getxattr(e.fd, DEFAULT_XATTR) is not None
+        if not (has_a or has_d):
+            return
+        plan.note(e.path, " + ".join(x for x in ("ACL d'accès retirée" if has_a else "",
+                                                 "ACL par défaut retirée" if has_d else "") if x))
+        if plan.dry_run:
+            return
+        if has_a:
+            strip_access(e.fd, e.st)
+        if has_d:
+            fd_removexattr(e.fd, DEFAULT_XATTR)
+
+    drive(target, params, plan, backup, apply)
 
 
 def template_entries(params):
@@ -831,261 +1235,371 @@ def template_entries(params):
     return entries
 
 
-def reset_acl_template(params, path, dataset, plan):
-    require_posix(dataset, "Le modèle d'ACL")
+def reset_acl_template(params, target, plan, backup):
+    require_posix(target.dataset, "Le modèle d'ACL")
     uid = resolve_uid(params.get("owner"))
     gid = resolve_gid(params.get("group"))
-    owner_p = params.get("owner_perms", "rwx")
-    group_p = params.get("group_perms", "rwx")
-    other_p = params.get("other_perms", "---")
+    base = [{"tag": "user", "qualifier": "", "perms": params.get("owner_perms", "rwx")},
+            {"tag": "group", "qualifier": "", "perms": params.get("group_perms", "rwx")},
+            {"tag": "other", "qualifier": "", "perms": params.get("other_perms", "---")}]
     mask_p = params.get("mask_perms", "rwx")
-    named = template_entries(params)
+    model = base + template_entries(params) + [{"tag": "mask", "qualifier": "", "perms": mask_p}]
+    ui_entries_to_acl(model, True, 0)  # validation avant toute écriture
     inherit = params.get("inherit", True)
-    base = [{"tag": "user", "qualifier": "", "perms": owner_p},
-            {"tag": "group", "qualifier": "", "perms": group_p}]
-    tail = [{"tag": "mask", "qualifier": "", "perms": mask_p},
-            {"tag": "other", "qualifier": "", "perms": other_p}]
-    dir_access = base + named + tail
-    dir_default = dir_access if inherit else []
-    # fichiers : X = exécutable seulement si déjà exécutable → on retire x simple
-    file_access = [dict(e, perms=e["perms"].replace("x", "X")) for e in dir_access]
-    files, dirs = [], []
-    for p, st in walk(path, params):
+    setgid_dirs = params.get("setgid_dirs", False)
+
+    def apply(e):
+        acl, mask = ui_entries_to_acl(model, e.is_dir, e.st.st_mode, x_to_cond=not e.is_dir)
+        acl = with_mask(acl, mask)
+        plan.note(e.path, "modèle d'ACL appliqué" + (", " + owner_change_desc(e.st, uid, gid) if owner_change_desc(e.st, uid, gid) else ""))
+        if plan.dry_run:
+            return
         if uid != -1 or gid != -1:
-            apply_owner_mode(plan, p, st, uid, gid, None)
-        (dirs if stat.S_ISDIR(st.st_mode) else files).append(p)
-        plan.note(p, "modèle d'ACL appliqué")
-    setfacl_batch(plan, ["--set", build_spec(dir_access, dir_default, True)], dirs)
-    setfacl_batch(plan, ["--set", build_spec(file_access, [], False)], files)
-    if params.get("setgid_dirs") and not plan.dry_run:
-        for d in dirs:
-            try:
-                os.chmod(d, stat.S_IMODE(os.lstat(d).st_mode) | stat.S_ISGID)
-            except OSError as e:
-                plan.error(d, e)
+            os.fchown(e.fd, uid, gid)
+        write_access(e.fd, acl)
+        if e.is_dir:
+            write_default(e.fd, with_mask(*ui_entries_to_acl(model, True, 0)) if inherit else [])
+        keep = stat.S_IMODE(e.st.st_mode) & (stat.S_ISUID | stat.S_ISGID) if not e.is_dir else 0
+        extra = stat.S_ISGID if (e.is_dir and setgid_dirs) else 0
+        if keep or extra:
+            os.fchmod(e.fd, stat.S_IMODE(os.fstat(e.fd).st_mode) | keep | extra)
+
+    drive(target, params, plan, backup, apply)
 
 
-def reset_inherit_parent(params, path, dataset, plan):
-    require_posix(dataset, "La propagation d'héritage")
-    if not os.path.isdir(path):
+def reset_inherit_parent(params, target, plan, backup):
+    require_posix(target.dataset, "La propagation d'héritage")
+    if not stat.S_ISDIR(target.st.st_mode):
         raise PermError("La propagation exige un dossier racine")
-    root_acl = getfacl(path)
-    defaults = root_acl["default"]
+    defaults = read_default(target.fd)
     if not defaults:
         if not params.get("fallback_access", False):
             raise PermError("Le dossier racine n'a pas d'ACL par défaut (cochez « utiliser l'ACL d'accès »)")
-        defaults = root_acl["access"]
+        defaults = read_access(target.fd, target.st)
     keep_exec = params.get("keep_exec", True)
-    dir_spec = build_spec(defaults, defaults, True)
-    file_entries = [dict(e, perms=e["perms"].replace("x", "X") if keep_exec else strip_exec(e["perms"]))
-                    for e in defaults]
-    file_spec = build_spec(file_entries, [], False)
-    files, dirs = [], []
-    for p, st in walk(path, dict(params, include_root=False)):
-        (dirs if stat.S_ISDIR(st.st_mode) else files).append(p)
-        plan.note(p, "hérite de %s" % path)
-    if params.get("reset_owner_to_root"):
-        st0 = os.lstat(path)
-        for p in dirs + files:
-            apply_owner_mode(plan, p, os.lstat(p), st0.st_uid, st0.st_gid, None)
-    setfacl_batch(plan, ["--set", dir_spec], dirs)
-    setfacl_batch(plan, ["--set", file_spec], files)
+    root_uid, root_gid = target.st.st_uid, target.st.st_gid
+    realign = params.get("reset_owner_to_root", False)
 
-
-def reset_mirror_reference(params, path, dataset, plan):
-    ref_dir = params.get("reference_dir") or params.get("reference")
-    ref_file = params.get("reference_file") or ref_dir
-    if not ref_dir:
-        raise PermError("Aucune référence fournie")
-    for r in (ref_dir, ref_file):
-        if not os.path.exists(r):
-            raise PermError("Référence introuvable : %s" % r)
-    posix = acl_mode_for(dataset) == "posix" and have("setfacl")
-    refs = {}
-    for kind, r in (("dir", ref_dir), ("file", ref_file)):
-        st = os.lstat(r)
-        refs[kind] = {"st": st, "acl": getfacl(r) if posix else None}
-    copy_owner = params.get("copy_owner", True)
-    files, dirs = [], []
-    for p, st in walk(path, params):
-        kind = "dir" if stat.S_ISDIR(st.st_mode) else "file"
-        ref = refs[kind]["st"]
-        apply_owner_mode(plan, p, st,
-                         ref.st_uid if copy_owner else -1, ref.st_gid if copy_owner else -1,
-                         stat.S_IMODE(ref.st_mode))
-        (dirs if kind == "dir" else files).append(p)
-    if posix:
-        for kind, targets in (("dir", dirs), ("file", files)):
-            acl = refs[kind]["acl"]
-            if acl and acl_is_extended(acl):
-                setfacl_batch(plan, ["--set", build_spec(acl["access"], acl["default"], kind == "dir")], targets)
-            elif targets:
-                setfacl_batch(plan, ["-b"], targets)
-
-
-def restore_dump(plan, dump_text, live_root, src_root, strict_root):
-    """Réécrit un dump getfacl -R (chemins sous src_root) vers live_root puis
-    l'applique avec setfacl --restore. Ignore les chemins absents."""
-    blocks = dump_text.split("\n\n")
-    kept, missing = [], 0
-    src_root = src_root.rstrip("/")
-    for block in blocks:
-        m = re.search(r"^# file: (.*)$", block, re.M)
-        if not m:
-            continue
-        src = m.group(1)
-        # getfacl échappe les caractères spéciaux en octal (\040 pour l'espace)
-        decoded = re.sub(r"\\([0-7]{3})", lambda mm: chr(int(mm.group(1), 8)), src)
-        if decoded != src_root and not decoded.startswith(src_root + "/"):
-            continue
-        live = live_root.rstrip("/") + decoded[len(src_root):]
-        if strict_root and live != strict_root and not live.startswith(strict_root.rstrip("/") + "/"):
-            continue
-        if not os.path.lexists(live) or os.path.islink(live):
-            missing += 1
-            continue
-        new_block = block.replace("# file: " + src, "# file: " + escape_getfacl_path(live), 1)
-        kept.append(new_block)
-        plan.note(live, "propriétaire / mode / ACL restaurés")
-    plan.command("setfacl --restore=- (%d entrées, %d absentes ignorées)" % (len(kept), missing))
-    if not plan.dry_run and kept:
-        proc = run(["setfacl", "--restore=-"], input_data="\n\n".join(kept) + "\n", check=False)
-        if proc.returncode != 0:
-            for line in proc.stderr.strip().splitlines()[:50]:
-                plan.error(live_root, line)
-    return missing
-
-
-def escape_getfacl_path(p):
-    out = []
-    for ch in p:
-        if ch in " \t\n\r\\" or ord(ch) < 32:
-            out.append("\\%03o" % ord(ch))
+    def apply(e):
+        if e.is_dir:
+            new_a, new_d = defaults, defaults
         else:
-            out.append(ch)
-    return "".join(out)
+            new_a = resolve_x_acl(defaults, False, e.st.st_mode if keep_exec else 0)
+            new_d = []
+        plan.note(e.path, "hérite de %s" % target.path)
+        if plan.dry_run:
+            return
+        if realign:
+            chown_keep_setid(e.fd, e.st, root_uid, root_gid)
+        write_access(e.fd, new_a)
+        if e.is_dir:
+            write_default(e.fd, new_d)
+
+    drive(target, dict(params, include_root=False), plan, backup, apply)
 
 
-def reset_from_snapshot(params, path, dataset, mountpoint, plan):
-    if not have("setfacl"):
-        raise PermError("setfacl introuvable : installer le paquet « acl »")
+def reset_mirror_reference(params, target, plan, backup):
+    ref_dir = params.get("reference_dir") or params.get("reference")
+    ref_file = params.get("reference_file") or ""
+    if not ref_dir:
+        raise PermError("Aucun dossier de référence fourni")
+    posix = acl_mode_for(target.dataset) == "posix"
+    refs = {}
+    for kind, path in (("d", ref_dir), ("f", ref_file)):
+        if not path:
+            continue
+        if os.path.realpath(path) != os.path.normpath(path):
+            raise PermError("La référence %s est (ou traverse) un lien symbolique : refusé" % path)
+        fd, st = open_nofollow(path, want=kind)
+        try:
+            refs[kind] = {"st": st, "a": read_access(fd, st) if posix else None,
+                          "d": read_default(fd) if posix and kind == "d" else []}
+        finally:
+            os.close(fd)
+    copy_owner = params.get("copy_owner", True)
+
+    def apply(e):
+        if e.is_dir or "f" in refs:
+            ref = refs["d" if e.is_dir else "f"]
+            mode = stat.S_IMODE(ref["st"].st_mode)
+            acl = ref["a"]
+            dacl = ref["d"] if e.is_dir else []
+        else:
+            # pas de référence fichier : modèle du dossier, x seulement si déjà exécutable (X)
+            ref = refs["d"]
+            rmode = stat.S_IMODE(ref["st"].st_mode) & 0o777
+            mode = rmode if e.st.st_mode & 0o111 else rmode & ~0o111
+            acl = resolve_x_acl(ref["a"], False, e.st.st_mode) if ref["a"] else None
+            dacl = []
+        uid = ref["st"].st_uid if copy_owner else -1
+        gid = ref["st"].st_gid if copy_owner else -1
+        changes = [c for c in (owner_change_desc(e.st, uid, gid),
+                               "mode %s → %04o" % (mode_str(e.st.st_mode), mode) if stat.S_IMODE(e.st.st_mode) != mode else None) if c]
+        if posix:
+            changes.append("ACL de la référence")
+        if not changes:
+            return
+        plan.note(e.path, ", ".join(changes))
+        if plan.dry_run:
+            return
+        if uid != -1 or gid != -1:
+            os.fchown(e.fd, uid, gid)
+        if posix:
+            write_access(e.fd, acl)       # ACL avant chmod : le masque suit ensuite le mode
+            if e.is_dir:
+                write_default(e.fd, dacl)
+        os.fchmod(e.fd, mode)
+
+    drive(target, params, plan, backup, apply)
+
+
+def apply_state(fd, cur_st, state, include_xattrs):
+    """Réapplique un état (snapshot ou sauvegarde) sur un descripteur."""
+    flags = get_fsflags_fd(fd)
+    if flags and flags & PROTECT_FLAGS:
+        set_fsflags_fd(fd, flags & ~PROTECT_FLAGS)
+    os.fchown(fd, state["u"], state["g"])
+    raw_a = unb64(state.get("a"))
+    if raw_a:
+        os.setxattr(fd, ACCESS_XATTR, raw_a)
+    else:
+        fd_removexattr(fd, ACCESS_XATTR)
+    if stat.S_ISDIR(cur_st.st_mode):
+        raw_d = unb64(state.get("d"))
+        if raw_d:
+            os.setxattr(fd, DEFAULT_XATTR, raw_d)
+        else:
+            fd_removexattr(fd, DEFAULT_XATTR)
+    os.fchmod(fd, state["m"])
+    if include_xattrs:
+        for name, val in (state.get("x") or {}).items():
+            raw = unb64(val)
+            if raw is None:
+                fd_removexattr(fd, name)
+            else:
+                os.setxattr(fd, name, raw)
+    want = state.get("f", 0)
+    flags = get_fsflags_fd(fd)
+    if flags is not None and (flags & PROTECT_FLAGS) != want:
+        set_fsflags_fd(fd, (flags & ~PROTECT_FLAGS) | want)
+
+
+def state_diff(fd, st, state, include_xattrs):
+    cur = snapshot_state(fd, st)
+    diffs = []
+    if (cur["u"], cur["g"]) != (state["u"], state["g"]):
+        diffs.append("propriétaire %s:%s → %s:%s" % (cur["u"], cur["g"], state["u"], state["g"]))
+    if cur["m"] != state["m"]:
+        diffs.append("mode %04o → %04o" % (cur["m"], state["m"]))
+    if cur["a"] != state.get("a") or (cur["t"] == "d" and cur["d"] != state.get("d")):
+        diffs.append("ACL")
+    if include_xattrs and cur["x"] != (state.get("x") or cur["x"]):
+        diffs.append("ACL NT / attributs DOS")
+    if cur["f"] != state.get("f", cur["f"]):
+        diffs.append("immutable / append-only")
+    return diffs
+
+
+def reset_from_snapshot(params, target, plan, backup):
     snap = params.get("snapshot", "")
     if "@" in snap:
         ds, snap = snap.split("@", 1)
-        if ds != dataset:
-            raise PermError("Le snapshot %s n'appartient pas à %s (le chemin est dans ce dataset)" % (ds, dataset))
+        if ds != target.dataset:
+            raise PermError("Le snapshot %s n'appartient pas à %s (le chemin est dans ce dataset)" % (ds, target.dataset))
     if not re.fullmatch(r"[A-Za-z0-9._:+-]+", snap):
         raise PermError("Nom de snapshot invalide")
-    rel = os.path.relpath(path, mountpoint)
-    snap_root = os.path.normpath(os.path.join(mountpoint, ".zfs", "snapshot", snap, rel))
-    if not os.path.exists(snap_root):
-        raise PermError("%s introuvable dans le snapshot %s" % (rel, snap))
-    proc = subprocess.run(["getfacl", "-R", "-P", "-p", "--absolute-names", "--", snap_root],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    missing = restore_dump(plan, proc.stdout, path, snap_root, path)
-    return {"snapshot": "%s@%s" % (dataset, snap), "missing": missing}
+    snapdir = os.path.join(target.mountpoint, ".zfs", "snapshot", snap)
+    try:
+        sfd = os.open(snapdir, OPEN_DIR)
+    except OSError as e:
+        raise PermError("Snapshot %s inaccessible : %s" % (snap, e.strerror))
+    rel_root = os.path.relpath(target.path, target.mountpoint)
+    try:
+        try:
+            srfd, srst = open_rel(sfd, rel_root, want="d" if stat.S_ISDIR(target.st.st_mode) else "f")
+        except (OSError, PermError) as e:
+            raise PermError("%s introuvable dans le snapshot %s (%s)" % (rel_root, snap, e))
+    finally:
+        os.close(sfd)
+    counters = {"missing": 0, "skipped_child": 0}
+
+    def apply(e):
+        if e.st.st_dev != target.st.st_dev:
+            counters["skipped_child"] += 1  # racine ou contenu d'un dataset enfant : pas dans ce snapshot
+            return
+        try:
+            nfd, nst = open_rel(srfd, e.rel, root_dev=srst.st_dev, want="d" if e.is_dir else "f")
+        except (OSError, PermError):
+            counters["missing"] += 1
+            return
+        try:
+            state = snapshot_state(nfd, nst)
+        finally:
+            os.close(nfd)
+        state["x"] = None
+        diffs = state_diff(e.fd, e.st, state, False)
+        if not diffs:
+            return
+        plan.note(e.path, ", ".join(diffs))
+        if not plan.dry_run:
+            apply_state(e.fd, e.st, state, False)
+
+    try:
+        drive(target, params, plan, backup, apply)
+    finally:
+        os.close(srfd)
+    return {"snapshot": "%s@%s" % (target.dataset, snap), **counters}
 
 
-def reset_from_backup(params, path, plan):
+def cmd_restore_backup(params):
     data, meta_path = backup_files(params.get("backup_id"))
     with open(meta_path) as f:
         meta = json.load(f)
-    with gzip.open(data, "rt", errors="surrogateescape") as f:
-        dump = f.read()
-    missing = restore_dump(plan, dump, meta["path"], meta["path"], path)
-    return {"restored_backup": meta, "missing": missing}
+    requested = os.path.normpath(params.get("path") or meta["path"])
+    root_path = meta["path"]
+    if requested != root_path and not requested.startswith(root_path.rstrip("/") + "/"):
+        raise PermError("La sauvegarde couvre %s, pas %s" % (root_path, requested))
+    target = resolve_target({"path": root_path}, write=True).open()
+    plan = Plan(params.get("dry_run", True))
+    prefix = os.path.relpath(requested, root_path)
+    cross = bool((meta.get("options") or {}).get("cross_datasets"))
+    include_xattrs = params.get("restore_xattrs", True)
+    missing = 0
+    try:
+        with gzip.open(data, "rb") as f:
+            for line in f:
+                rec = json.loads(line)
+                rel = os.fsdecode(unb64(rec["r"]))
+                if prefix != "." and rel != prefix and not rel.startswith(prefix + "/"):
+                    continue
+                path = target.path if rel == "." else os.path.join(target.path, rel)
+                try:
+                    fd, st = open_rel(target.fd, rel, root_dev=None if cross else target.st.st_dev, want=rec["t"])
+                except (OSError, PermError):
+                    missing += 1
+                    continue
+                try:
+                    diffs = state_diff(fd, st, rec, include_xattrs)
+                    if diffs:
+                        plan.note(path, ", ".join(diffs))
+                        if not plan.dry_run:
+                            apply_state(fd, st, rec, include_xattrs)
+                except OSError as e:
+                    plan.error(path, e)
+                finally:
+                    os.close(fd)
+    finally:
+        target.close()
+    return plan.result(method="from-backup", path=requested, dataset=target.dataset, backup=None,
+                       restored_backup=meta, missing=missing)
 
 
-def reset_clear_ntacl(params, path, plan):
-    names = [NTACL_XATTR]
-    if params.get("dosattrib"):
-        names.append(DOSATTRIB_XATTR)
-    for p, _st in walk(path, params):
-        x = list_xattrs(p)
+def reset_clear_ntacl(params, target, plan, backup):
+    names = [NTACL_XATTR] + ([DOSATTRIB_XATTR] if params.get("dosattrib") else [])
+
+    def apply(e):
+        try:
+            x = os.listxattr(e.fd)
+        except OSError:
+            return
         present = [n for n in names if n in x]
         if not present:
-            continue
-        plan.note(p, "retrait de " + ", ".join(present))
-        if plan.dry_run:
-            continue
-        for n in present:
-            try:
-                os.removexattr(p, n, follow_symlinks=False)
-            except OSError as e:
-                plan.error(p, e)
+            return
+        plan.note(e.path, "retrait de " + ", ".join(present))
+        if not plan.dry_run:
+            for n in present:
+                fd_removexattr(e.fd, n)
+
+    drive(target, params, plan, backup, apply)
 
 
-def reset_orphans(params, path, plan):
+def reset_orphans(params, target, plan, backup):
     uid = resolve_uid(params.get("owner"))
     gid = resolve_gid(params.get("group"))
     if uid == -1 and gid == -1:
         raise PermError("Indiquez un propriétaire et / ou un groupe de remplacement")
-    for p, st in walk(path, params):
-        new_uid = uid if uid != -1 and uid_name(st.st_uid) is None else -1
-        new_gid = gid if gid != -1 and gid_name(st.st_gid) is None else -1
-        if new_uid != -1 or new_gid != -1:
-            apply_owner_mode(plan, p, st, new_uid, new_gid, None)
+
+    def apply(e):
+        nu = uid if uid != -1 and uid_name(e.st.st_uid) is None else -1
+        ng = gid if gid != -1 and gid_name(e.st.st_gid) is None else -1
+        desc = owner_change_desc(e.st, nu, ng)
+        if not desc:
+            return
+        plan.note(e.path, desc)
+        if not plan.dry_run:
+            chown_keep_setid(e.fd, e.st, nu, ng)
+
+    drive(target, params, plan, backup, apply)
 
 
-def reset_takeown(params, path, plan):
+def reset_takeown(params, target, plan, backup):
     uid = resolve_uid(params.get("owner"))
     gid = resolve_gid(params.get("group"))
     if uid == -1 and gid == -1:
         raise PermError("Indiquez un propriétaire et / ou un groupe")
     preserve = params.get("preserve_setid", True)
-    for p, st in walk(path, params):
-        apply_owner_mode(plan, p, st, uid, gid,
-                         stat.S_IMODE(st.st_mode) if preserve and st.st_mode & (stat.S_ISUID | stat.S_ISGID) else None)
 
-
-def reset_chattr_clear(params, path, plan):
-    for p, st in walk(path, params):
-        fl = get_fsflags(p)
-        if not fl or not fl & (FS_IMMUTABLE_FL | FS_APPEND_FL):
-            continue
-        plan.note(p, "immutable / append-only retirés")
+    def apply(e):
+        desc = owner_change_desc(e.st, uid, gid)
+        if not desc:
+            return
+        plan.note(e.path, desc)
         if plan.dry_run:
-            continue
-        try:
-            set_fsflags(p, fl & ~(FS_IMMUTABLE_FL | FS_APPEND_FL))
-        except OSError as e:
-            plan.error(p, e)
+            return
+        if preserve:
+            chown_keep_setid(e.fd, e.st, uid, gid)
+        else:
+            os.fchown(e.fd, uid, gid)
+
+    drive(target, params, plan, backup, apply)
+
+
+def reset_chattr_clear(params, target, plan, backup):
+    def apply(e):
+        fl = get_fsflags_fd(e.fd)
+        if not fl or not fl & PROTECT_FLAGS:
+            return
+        plan.note(e.path, "immutable / append-only retirés")
+        if not plan.dry_run:
+            set_fsflags_fd(e.fd, fl & ~PROTECT_FLAGS)
+
+    drive(target, params, plan, backup, apply)
+
+
+RESET_IMPL = {
+    "unix-mode": reset_unix_mode,
+    "strip-acl": reset_strip_acl,
+    "acl-template": reset_acl_template,
+    "inherit-parent": reset_inherit_parent,
+    "mirror-reference": reset_mirror_reference,
+    "from-snapshot": reset_from_snapshot,
+    "clear-ntacl": reset_clear_ntacl,
+    "orphans": reset_orphans,
+    "takeown": reset_takeown,
+    "chattr-clear": reset_chattr_clear,
+}
 
 
 def cmd_reset(params):
     method = params.get("method")
     if method not in RESET_METHODS:
         raise PermError("Méthode inconnue : %s" % method)
-    path, dataset, mountpoint = resolve_target(params, write=True)
-    dry = params.get("dry_run", True)
-    plan = Plan(dry)
-    backup = None
-    if not dry and params.get("backup", True) and method not in ("from-backup",):
-        backup = create_backup(path, dataset, "avant %s" % method)
-    extra = {}
-    if method == "unix-mode":
-        reset_unix_mode(params, path, dataset, plan)
-    elif method == "strip-acl":
-        reset_strip_acl(params, path, dataset, plan)
-    elif method == "acl-template":
-        reset_acl_template(params, path, dataset, plan)
-    elif method == "inherit-parent":
-        reset_inherit_parent(params, path, dataset, plan)
-    elif method == "mirror-reference":
-        reset_mirror_reference(params, path, dataset, plan)
-    elif method == "from-snapshot":
-        extra = reset_from_snapshot(params, path, dataset, mountpoint, plan)
-    elif method == "from-backup":
-        extra = reset_from_backup(params, path, plan)
-    elif method == "clear-ntacl":
-        reset_clear_ntacl(params, path, plan)
-    elif method == "orphans":
-        reset_orphans(params, path, plan)
-    elif method == "takeown":
-        reset_takeown(params, path, plan)
-    elif method == "chattr-clear":
-        reset_chattr_clear(params, path, plan)
-    return plan.result(method=method, path=path, dataset=dataset, backup=backup, **extra)
+    if method == "from-backup":
+        return cmd_restore_backup(params)
+    target, plan, backup = begin(params, method)
+    try:
+        extra = RESET_IMPL[method](params, target, plan, backup) or {}
+    except BaseException:
+        meta = backup.close() if backup is not None else None
+        target.close()
+        if meta is not None and meta["entries"] == 0:
+            for suffix in (".perm.jsonl.gz", ".json"):
+                try:
+                    os.unlink(os.path.join(BACKUP_DIR, meta["id"] + suffix))
+                except OSError:
+                    pass
+        raise
+    return finish(target, plan, backup, method=method, **extra)
 
 
 # --------------------------------------------------------------------------- délégation zfs allow
@@ -1137,24 +1651,28 @@ def cmd_delegation(params):
     dataset = params.get("dataset")
     if not dataset:
         raise PermError("Dataset requis")
-    out = run(["zfs", "allow", dataset]).stdout
+    _c, out, _e = run(["zfs", "allow", dataset])
     return {"dataset": dataset, "entries": parse_zfs_allow(out), "known_perms": ZFS_DELEGATION_PERMS, "raw": out}
 
 
 def cmd_delegate(params):
     dataset = params.get("dataset")
-    op = params.get("op", "allow")  # allow | unallow
-    kind = params.get("kind", "user")  # user | group | everyone | create | set
-    who = params.get("who", "")
-    scope = params.get("scope", "both")  # local | descendent | both
+    op = params.get("op", "allow")
+    kind = params.get("kind", "user")
+    who = str(params.get("who", "") or "")
+    scope = params.get("scope", "both")
     perms = [p.strip() for p in params.get("perms", []) if p.strip()]
-    if not dataset:
+    if not dataset or dataset.startswith("-"):
         raise PermError("Dataset requis")
+    if op not in ("allow", "unallow"):
+        raise PermError("Opération inconnue : %s" % op)
     if not perms and not (op == "unallow" and params.get("all")):
         raise PermError("Aucune permission indiquée")
     for p in perms:
-        if not re.fullmatch(r"@?[A-Za-z0-9_:.-]+", p):
+        if not re.fullmatch(r"@?[A-Za-z0-9_][A-Za-z0-9_:.-]*", p):
             raise PermError("Permission invalide : %s" % p)
+    if who.startswith("-"):
+        raise PermError("Bénéficiaire invalide : %s" % who)
     cmd = ["zfs", op]
     if op == "unallow" and params.get("recursive"):
         cmd.append("-r")
@@ -1164,21 +1682,17 @@ def cmd_delegate(params):
         elif scope == "descendent":
             cmd.append("-d")
     if kind == "user":
-        if not who:
-            raise PermError("Utilisateur requis")
-        resolve_uid(who)
+        resolve_uid(who, False)
         cmd += ["-u", who]
     elif kind == "group":
-        if not who:
-            raise PermError("Groupe requis")
-        resolve_gid(who)
+        resolve_gid(who, False)
         cmd += ["-g", who]
     elif kind == "everyone":
         cmd.append("-e")
     elif kind == "create":
         cmd.append("-c")
     elif kind == "set":
-        if not re.fullmatch(r"@[A-Za-z0-9_.-]+", who or ""):
+        if not re.fullmatch(r"@[A-Za-z0-9_][A-Za-z0-9_.-]*", who):
             raise PermError("Nom d'ensemble invalide (format @nom)")
         cmd += ["-s", who]
     else:
@@ -1186,7 +1700,7 @@ def cmd_delegate(params):
     if perms:
         cmd.append(",".join(perms))
     cmd.append(dataset)
-    if params.get("dry_run", False):
+    if params.get("dry_run", True):
         return {"dry_run": True, "command": " ".join(cmd)}
     run(cmd)
     return {"dry_run": False, "command": " ".join(cmd)}
@@ -1207,7 +1721,7 @@ def cmd_preset(params):
         if v is None:
             continue
         current = props.get(k, {}).get("value")
-        if current == v:
+        if norm_prop(k, current) == norm_prop(k, v):
             continue
         if k in ("normalization", "casesensitivity", "utf8only"):
             changes.append({"prop": k, "from": current, "to": v,
@@ -1226,9 +1740,9 @@ def cmd_preset(params):
         return {"dry_run": True, "changes": changes, "commands": [" ".join(c) for c in commands], "notes": notes}
     errors = []
     for c in commands:
-        proc = run(c, check=False)
-        if proc.returncode != 0:
-            errors.append({"command": " ".join(c), "error": proc.stderr.strip()})
+        code, _o, err = run(c, check=False)
+        if code != 0:
+            errors.append({"command": " ".join(c), "error": err.strip()})
     return {"dry_run": False, "changes": changes, "commands": [" ".join(c) for c in commands],
             "errors": errors, "notes": notes}
 
@@ -1249,21 +1763,25 @@ COMMANDS = {
 }
 
 
+def emit(obj):
+    # ASCII : les noms non UTF-8 (surrogates) sont échappés en \udcXX, JSON valide
+    sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
+
+
 def main(argv):
     if len(argv) < 2 or argv[1] not in COMMANDS:
-        print(json.dumps({"ok": False, "error": "Commande inconnue. Choix : " + ", ".join(COMMANDS)}))
+        emit({"ok": False, "error": "Commande inconnue. Choix : " + ", ".join(COMMANDS)})
         return 0
     try:
         params = json.loads(argv[2]) if len(argv) > 2 and argv[2] else {}
         result = COMMANDS[argv[1]](params)
         result["ok"] = True
-        print(json.dumps(result, ensure_ascii=False))
+        emit(result)
     except PermError as e:
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        emit({"ok": False, "error": str(e)})
     except Exception as e:  # erreur inattendue : on renvoie la trace au lieu de planter l'interface
         import traceback
-        print(json.dumps({"ok": False, "error": "%s: %s" % (type(e).__name__, e),
-                          "trace": traceback.format_exc()}, ensure_ascii=False))
+        emit({"ok": False, "error": "%s: %s" % (type(e).__name__, e), "trace": traceback.format_exc()})
     return 0
 
 

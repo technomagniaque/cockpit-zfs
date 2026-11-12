@@ -66,9 +66,11 @@
 					<table class="w-full mt-1 text-xs">
 						<thead><tr class="text-left text-muted"><th>Nom</th><th>Mode</th><th>Propriétaire</th><th>Groupe</th><th>Indicateurs</th></tr></thead>
 						<tbody>
-							<tr v-for="c in state.children" :key="c.path" class="border-t border-default hover:bg-accent cursor-pointer"
-								@click="open(c.path)">
-								<td class="font-mono py-0.5 text-default">{{ basename(c.path) }}{{ c.type === 'dir' ? '/' : '' }}</td>
+							<tr v-for="c in state.children" :key="c.path" class="border-t border-default"
+								:class="c.type === 'dir' || c.type === 'file' ? 'hover:bg-accent cursor-pointer' : 'text-muted'"
+								:title="c.type === 'link' ? 'Lien symbolique : non suivi' : ''"
+								@click="(c.type === 'dir' || c.type === 'file') && open(c.path)">
+								<td class="font-mono py-0.5 text-default">{{ basename(c.path) }}{{ c.type === 'dir' ? '/' : c.type === 'link' ? ' →' : '' }}</td>
 								<td class="font-mono text-default">{{ c.symbolic }}</td>
 								<td class="text-default">{{ c.owner ?? c.uid }}</td>
 								<td class="text-default">{{ c.group ?? c.gid }}</td>
@@ -138,7 +140,8 @@
 			<!-- Sauvegardes -->
 			<div v-else-if="tab === 'backups'" class="text-sm space-y-2">
 				<p class="text-muted">
-					Dumps <span class="font-mono">getfacl -R</span> pris avant chaque réinitialisation, dans
+					État (propriétaire, mode, ACL, ACL NT, attributs DOS, immutable) de chaque objet, enregistré juste avant sa
+					modification lors d'une réinitialisation ou d'une édition d'ACL, dans
 					<span class="font-mono">/var/lib/cockpit-zfs/permission-backups</span>. Restaurez-les depuis l'onglet
 					« Réinitialiser » (méthode « Restaurer une sauvegarde »).
 				</p>

@@ -22,7 +22,7 @@ export interface PosixAcl {
 
 export interface PathInfo {
 	path: string;
-	type: 'dir' | 'file' | 'link';
+	type: 'dir' | 'file' | 'link' | 'other';
 	mode: string;
 	symbolic: string;
 	uid: number;
@@ -152,7 +152,7 @@ export async function permissionsCall<T = any>(command: string, params: object =
 export const inspectPath = (path: string) => permissionsCall<InspectResult>('inspect', { path });
 export const auditPath = (path: string, opts: WalkOptions & { max_entries?: number; check_flags?: boolean } = {}) =>
 	permissionsCall<AuditResult>('audit', { path, ...opts });
-export const setAcl = (params: { path: string; action: 'set' | 'modify' | 'remove' | 'remove-default'; access: AclEntry[]; default: AclEntry[]; dry_run: boolean; files_conditional_x?: boolean } & WalkOptions) =>
+export const setAcl = (params: { path: string; action: 'set' | 'modify' | 'remove' | 'remove-default'; access: AclEntry[]; default: AclEntry[]; dry_run: boolean; files_conditional_x?: boolean; backup?: boolean } & WalkOptions) =>
 	permissionsCall<PlanResult>('set-acl', params);
 export const resetPermissions = (method: ResetMethod, path: string, options: Record<string, unknown>, dryRun: boolean) =>
 	permissionsCall<PlanResult>('reset', { ...options, method, path, dry_run: dryRun });

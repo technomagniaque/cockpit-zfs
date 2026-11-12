@@ -55,11 +55,15 @@
 			<div class="flex flex-row flex-wrap gap-4 text-sm items-center">
 				<label class="text-default">Action
 					<select v-model="action" class="input-textlike bg-default ml-1">
-						<option value="set">Remplacer (setfacl --set)</option>
+						<option value="set">Remplacer (équiv. setfacl --set ; ACL par défaut remplacée si elle est fournie)</option>
 						<option value="modify">Fusionner (setfacl -m)</option>
 						<option value="remove">Retirer les entrées nommées listées (setfacl -x)</option>
 						<option value="remove-default">Retirer l'ACL par défaut (setfacl -k)</option>
 					</select>
+				</label>
+				<label class="flex items-center gap-2 text-default">
+					<input type="checkbox" v-model="backup" class="input-checkbox" />
+					Sauvegarder avant d'appliquer
 				</label>
 				<label class="flex items-center gap-2 text-default" title="Sur les fichiers, x devient X : exécutable seulement s'il l'était déjà">
 					<input type="checkbox" v-model="conditionalX" class="input-checkbox" />
@@ -70,7 +74,7 @@
 			<div class="flex flex-row gap-2">
 				<button class="btn btn-secondary" :disabled="busy || aclMode !== 'posix'" @click="run(true)">Simuler</button>
 				<button class="btn btn-primary" :disabled="busy || aclMode !== 'posix'" @click="run(false)">
-					{{ confirmPending ? 'Confirmer l\'application' : 'Appliquer' }}
+					{{ confirmPending ? 'Confirmer : modifier ' + (plan?.count ?? '?') + ' objet(s)' : 'Appliquer' }}
 				</button>
 				<button class="btn btn-secondary" :disabled="busy" @click="resetFromSource">Annuler les modifications</button>
 			</div>
@@ -98,6 +102,8 @@ const action = ref<'set' | 'modify' | 'remove' | 'remove-default'>('set');
 const conditionalX = ref(true);
 const walk = reactive<WalkOptions>({ recursive: false, include_root: true, cross_datasets: false, types: 'all', include: [], exclude: [], max_depth: null });
 const plan = ref<PlanResult | null>(null);
+const backup = ref(true);
+const simulatedKey = ref<string | null>(null);
 const busy = ref(false);
 const confirmPending = ref(false);
 const draft = reactive<Record<'access' | 'default', AclEntry>>({
@@ -111,6 +117,7 @@ function resetFromSource() {
 	defaults.value = clone(props.acl?.default ?? []);
 	plan.value = null;
 	confirmPending.value = false;
+	simulatedKey.value = null;
 }
 watch(() => [props.acl, props.path], resetFromSource, { immediate: true });
 
@@ -160,24 +167,60 @@ function copyAccessToDefault() {
 	defaults.value = clone(access.value);
 }
 
+function request(dryRun: boolean) {
+	ensureMask(access.value);
+	ensureMask(defaults.value);
+	return {
+		path: props.path, action: action.value, access: clone(access.value), default: clone(defaults.value),
+		dry_run: dryRun, files_conditional_x: conditionalX.value, backup: backup.value, ...walk,
+	};
+}
+const currentKey = () => JSON.stringify({ ...request(true), dry_run: null });
+
+// toute modification après la simulation désarme la confirmation
+watch([access, defaults, action, conditionalX, backup, walk], () => {
+	if (simulatedKey.value !== null && simulatedKey.value !== currentKey()) {
+		confirmPending.value = false;
+		simulatedKey.value = null;
+		plan.value = null;
+	}
+}, { deep: true });
+
+async function simulate(): Promise<boolean> {
+	confirmPending.value = false;
+	simulatedKey.value = null;
+	plan.value = null;
+	const key = currentKey();
+	busy.value = true;
+	try {
+		plan.value = await setAcl(request(true));
+		simulatedKey.value = key;
+		return true;
+	} catch (e: any) {
+		pushNotification(new Notification('Échec de la simulation', e.message, 'error', 8000));
+		return false;
+	} finally {
+		busy.value = false;
+	}
+}
+
 async function run(dryRun: boolean) {
-	if (!dryRun && !confirmPending.value) {
-		confirmPending.value = true;
+	if (dryRun) {
+		await simulate();
+		return;
+	}
+	// simulation obligatoire : la confirmation n'est armée qu'après une simulation réussie
+	if (!confirmPending.value || simulatedKey.value !== currentKey()) {
+		if (await simulate()) confirmPending.value = true;
 		return;
 	}
 	confirmPending.value = false;
 	busy.value = true;
 	try {
-		ensureMask(access.value);
-		ensureMask(defaults.value);
-		plan.value = await setAcl({
-			path: props.path, action: action.value, access: access.value, default: defaults.value,
-			dry_run: dryRun, files_conditional_x: conditionalX.value, ...walk,
-		});
-		if (!dryRun) {
-			pushNotification(new Notification('ACL appliquée', `${plan.value.count} objet(s) modifié(s)`, plan.value.error_count ? 'warning' : 'success', 5000));
-			emit('changed');
-		}
+		plan.value = await setAcl(request(false));
+		simulatedKey.value = null;
+		pushNotification(new Notification('ACL appliquée', `${plan.value.count} objet(s) modifié(s)` + (plan.value.backup ? ` — sauvegarde ${plan.value.backup.id}` : ''), plan.value.error_count ? 'warning' : 'success', 5000));
+		emit('changed');
 	} catch (e: any) {
 		pushNotification(new Notification('Échec de l\'édition d\'ACL', e.message, 'error', 8000));
 	} finally {

@@ -67,7 +67,7 @@
 
 		<label v-if="method !== 'from-backup'" class="flex items-center gap-2 text-sm text-default">
 			<input type="checkbox" v-model="backup" class="input-checkbox" />
-			Sauvegarder les permissions actuelles avant d'appliquer (getfacl -R, restaurable)
+			Sauvegarder l'état de chaque objet avant de le modifier (restaurable)
 		</label>
 
 		<div class="flex flex-row gap-2">
@@ -140,7 +140,7 @@ const methodList: MethodDef[] = [
 	},
 	{
 		id: 'mirror-reference', label: 'Copier depuis une référence',
-		help: 'Applique propriétaire, mode et ACL d\'un dossier (et éventuellement d\'un fichier) de référence à tout l\'arbre.',
+		help: 'Applique propriétaire, mode et ACL d\'un dossier (et d\'un fichier) de référence à tout l\'arbre. Sans fichier de référence, les fichiers reçoivent le modèle du dossier avec x seulement s\'ils étaient déjà exécutables. Une référence qui est un lien symbolique est refusée.',
 		fields: [
 			{ key: 'reference_dir', label: 'Dossier de référence', type: 'path', default: '', placeholder: '/tank/modele' },
 			{ key: 'reference_file', label: 'Fichier de référence (vide = dossier)', type: 'path', default: '' },
@@ -148,12 +148,12 @@ const methodList: MethodDef[] = [
 	},
 	{
 		id: 'from-snapshot', label: 'Restaurer depuis un snapshot ZFS',
-		help: 'Relit propriétaires, modes, setgid/sticky et ACL dans .zfs/snapshot/<nom>/ et les réapplique aux fichiers actuels. Les données ne sont pas touchées ; les fichiers créés depuis le snapshot sont ignorés.',
+		help: 'Relit propriétaires, modes, setgid/sticky et ACL dans .zfs/snapshot/<nom>/ et les réapplique aux fichiers actuels. Les données ne sont pas touchées ; les fichiers créés depuis le snapshot et les datasets enfants sont ignorés.',
 		fields: [{ key: 'snapshot', label: 'Snapshot', type: 'snapshot', default: '' }],
 	},
 	{
 		id: 'from-backup', label: 'Restaurer une sauvegarde de permissions',
-		help: 'Réapplique un dump getfacl pris automatiquement avant une réinitialisation (setfacl --restore).',
+		help: 'Réapplique l\'état enregistré avant une réinitialisation ou une édition d\'ACL (propriétaire, mode, ACL, ACL NT, attributs DOS, immutable). Les objets remplacés par un lien ou passés dans un autre dataset sont ignorés.',
 		fields: [{ key: 'backup_id', label: 'Sauvegarde', type: 'backup', default: '' }],
 	},
 	{
@@ -188,15 +188,37 @@ const confirmPending = ref(false);
 const plan = ref<PlanResult | null>(null);
 const snapshots = ref<string[]>([]);
 const backups = ref<BackupMeta[]>([]);
+/** paramètres exacts de la dernière simulation réussie */
+const simulatedKey = ref<string | null>(null);
+
+function buildOptions(): Record<string, unknown> {
+	const options: Record<string, unknown> = { ...walk, ...opts, backup: backup.value };
+	if (method.value === 'acl-template') {
+		options.entries = (opts.entries ?? []).filter((e: any) => e.qualifier);
+	}
+	return options;
+}
+const currentKey = () => JSON.stringify({ m: method.value, p: props.path, o: buildOptions() });
+
+function disarm() {
+	confirmPending.value = false;
+	simulatedKey.value = null;
+}
 
 function loadDefaults() {
 	for (const k of Object.keys(opts)) delete opts[k];
 	for (const f of current.value.fields) opts[f.key] = Array.isArray(f.default) ? [] : f.default;
 	plan.value = null;
-	confirmPending.value = false;
+	disarm();
 }
 watch(method, loadDefaults, { immediate: true });
-watch(() => props.path, () => { plan.value = null; confirmPending.value = false; });
+// toute modification après la simulation désarme la confirmation
+watch([opts, walk, backup, () => props.path], () => {
+	if (simulatedKey.value !== null && simulatedKey.value !== currentKey()) {
+		disarm();
+		plan.value = null;
+	}
+}, { deep: true });
 
 async function refreshSources() {
 	snapshots.value = props.dataset ? await listDatasetSnapshots(props.dataset) : [];
@@ -205,28 +227,43 @@ async function refreshSources() {
 watch(() => props.dataset, refreshSources);
 onMounted(refreshSources);
 
+async function simulate(): Promise<boolean> {
+	disarm();
+	plan.value = null;
+	const key = currentKey();
+	busy.value = true;
+	try {
+		plan.value = await resetPermissions(method.value, props.path, buildOptions(), true);
+		simulatedKey.value = key;
+		return true;
+	} catch (e: any) {
+		pushNotification(new Notification('Échec de la simulation', e.message, 'error', 8000));
+		return false;
+	} finally {
+		busy.value = false;
+	}
+}
+
 async function run(dryRun: boolean) {
-	if (!dryRun && !confirmPending.value) {
-		// première pression : simulation pour afficher le volume, puis demande de confirmation
-		await run(true);
-		if (plan.value) confirmPending.value = true;
+	if (dryRun) {
+		await simulate();
+		return;
+	}
+	// 1re pression : simulation ; la confirmation n'est armée que si elle réussit
+	if (!confirmPending.value || simulatedKey.value !== currentKey()) {
+		if (await simulate()) confirmPending.value = true;
 		return;
 	}
 	confirmPending.value = false;
 	busy.value = true;
 	try {
-		const options: Record<string, unknown> = { ...walk, ...opts, backup: backup.value };
-		if (method.value === 'acl-template') {
-			options.entries = (opts.entries ?? []).filter((e: any) => e.qualifier);
-		}
-		plan.value = await resetPermissions(method.value, props.path, options, dryRun);
-		if (!dryRun) {
-			pushNotification(new Notification('Permissions réinitialisées',
-				`${current.value.label} : ${plan.value.count} changement(s)` + (plan.value.backup ? ` — sauvegarde ${plan.value.backup.id}` : ''),
-				plan.value.error_count ? 'warning' : 'success', 6000));
-			emit('changed');
-			refreshSources();
-		}
+		plan.value = await resetPermissions(method.value, props.path, buildOptions(), false);
+		simulatedKey.value = null;
+		pushNotification(new Notification('Permissions réinitialisées',
+			`${current.value.label} : ${plan.value.count} changement(s)` + (plan.value.backup ? ` — sauvegarde ${plan.value.backup.id}` : ''),
+			plan.value.error_count ? 'warning' : 'success', 6000));
+		emit('changed');
+		refreshSources();
 	} catch (e: any) {
 		pushNotification(new Notification('Échec de la réinitialisation', e.message, 'error', 8000));
 	} finally {

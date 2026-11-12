@@ -13,6 +13,10 @@
 			<div v-if="props.tag === 'filesystems'" class="p-2">
 				<component :is="fileSystemListComponent"/>
 			</div>
+
+			<div v-if="props.tag === 'permissions'" class="p-2">
+				<component :is="permissionsComponent"/>
+			</div>
 		</div>
 	</div>
 </template>
@@ -262,6 +266,12 @@ const loadFileSystemListComponent = async () => {
 	fileSystemListComponent.value = module.default;
 }
 
+const permissionsComponent = ref();
+const loadPermissionsComponent = async () => {
+	const module = await import('../components/permissions/PermissionsManager.vue');
+	permissionsComponent.value = module.default;
+}
+
 const canDestructive = ref(false);
 
 onMounted(async () => {
@@ -278,6 +288,9 @@ watchEffect(() => {
 	}
 	if (props.tag === 'filesystems') {
 		loadFileSystemListComponent();
+	}
+	if (props.tag === 'permissions') {
+		loadPermissionsComponent();
 	}
 });
 /////////////////////////////////////////////////////

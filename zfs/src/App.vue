@@ -44,6 +44,7 @@ const navigation = reactive<NavigationItem[]>([
 	{ name: 'Dashboard', tag: 'dashboard', current: computed(() => navTag.value == 'dashboard') as unknown as boolean, show: true, },
 	{ name: 'Pools', tag: 'pools', current: computed(() => navTag.value == 'pools') as unknown as boolean, show: true, },
 	{ name: 'Datasets', tag: 'filesystems', current: computed(() => navTag.value == 'filesystems') as unknown as boolean, show: true, },
+	{ name: 'Permissions', tag: 'permissions', current: computed(() => navTag.value == 'permissions') as unknown as boolean, show: true, },
 ].filter(item => item.show));
 
 // function setUpMessageHandler(handler: (message:string) => void) {

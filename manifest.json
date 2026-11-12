@@ -21,6 +21,7 @@
         "ubuntu_common": [
             "cockpit",
             "python3",
+            "acl",
             "python3-libzfs",
             "python3-pip",
             "sqlite3",
@@ -32,6 +33,7 @@
         "rocky_common": [
             "cockpit",
             "python3",
+            "acl",
             "python3-libzfs",
             "python3-pip",
             "sqlite",
@@ -43,6 +45,7 @@
         "debian": [
             "cockpit",
             "python3",
+            "acl",
             "python3-libzfs",
             "python3-pip",
             "sqlite3",
@@ -58,6 +61,7 @@
             "cockpit-storaged",
             "cockpit-packagekit",
             "python3",
+            "acl",
             "python3-libzfs",
             "python3-pip",
             "sqlite3",

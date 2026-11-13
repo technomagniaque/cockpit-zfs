@@ -2440,6 +2440,18 @@ def cmd_delegation(params):
     return {"dataset": dataset, "entries": parse_zfs_allow(out), "known_perms": ZFS_DELEGATION_PERMS, "raw": out}
 
 
+# Permissions qu'il est dangereux de déléguer à « tout le monde » (zfs allow -e) : un utilisateur quelconque
+# pourrait recevoir un flux contenant des binaires setuid ou des périphériques, créer et monter des datasets,
+# détruire ou renommer des données, ou redéléguer lui-même (allow). Les @ensembles sont traités comme
+# dangereux : leur contenu peut changer après coup.
+EVERYONE_DANGEROUS_PERMS = {"allow", "receive", "setuid", "devices", "create", "mount", "destroy", "rename",
+                            "promote", "clone", "zoned"}
+
+
+def everyone_dangerous(perms):
+    return [p for p in perms if p in EVERYONE_DANGEROUS_PERMS or p.startswith("@")]
+
+
 def cmd_delegate(params):
     dataset = params.get("dataset")
     op = params.get("op", "allow")
@@ -2487,10 +2499,20 @@ def cmd_delegate(params):
     if perms:
         cmd.append(",".join(perms))
     cmd.append(dataset)
+    warnings = []
+    risky = everyone_dangerous(perms) if (op == "allow" and kind == "everyone") else []
+    if risky:
+        warnings.append("Délégation à TOUT LE MONDE de permissions dangereuses (%s) : n'importe quel utilisateur "
+                        "du système pourra s'en servir (flux setuid via receive, création et montage de datasets, "
+                        "destruction, redélégation). Confirmation explicite requise." % ", ".join(risky))
     if params.get("dry_run", True):
-        return {"dry_run": True, "command": " ".join(cmd)}
+        return {"dry_run": True, "command": " ".join(cmd), "warnings": warnings,
+                "requires_confirmation": bool(risky)}
+    if risky and params.get("confirmer_tout_le_monde") is not True:
+        raise PermError("Refusé : délégation à tout le monde de %s sans confirmation explicite "
+                        "(paramètre confirmer_tout_le_monde)" % ", ".join(risky))
     run(cmd)
-    return {"dry_run": False, "command": " ".join(cmd)}
+    return {"dry_run": False, "command": " ".join(cmd), "warnings": warnings}
 
 
 # --------------------------------------------------------------------------- préréglages

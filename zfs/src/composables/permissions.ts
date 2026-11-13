@@ -314,8 +314,10 @@ export const listBackups = () => permissionsCall<{ backups: BackupMeta[] }>('bac
 export const deleteBackup = (id: string) => permissionsCall('delete-backup', { id });
 export const getDelegation = (dataset: string) =>
 	permissionsCall<{ dataset: string; entries: DelegationEntry[]; known_perms: string[]; raw: string }>('delegation', { dataset });
-export const delegate = (params: { dataset: string; op: 'allow' | 'unallow'; kind: 'user' | 'group' | 'everyone' | 'create' | 'set'; who?: string; scope?: 'local' | 'descendent' | 'both'; perms: string[]; recursive?: boolean; dry_run?: boolean }) =>
-	permissionsCall<{ dry_run: boolean; command: string }>('delegate', params);
+/** Permissions refusées pour « tout le monde » sans confirmation (même liste que EVERYONE_DANGEROUS_PERMS du backend). */
+export const EVERYONE_DANGEROUS_PERMS = ['allow', 'receive', 'setuid', 'devices', 'create', 'mount', 'destroy', 'rename', 'promote', 'clone', 'zoned'];
+export const delegate = (params: { dataset: string; op: 'allow' | 'unallow'; kind: 'user' | 'group' | 'everyone' | 'create' | 'set'; who?: string; scope?: 'local' | 'descendent' | 'both'; perms: string[]; recursive?: boolean; dry_run?: boolean; confirmer_tout_le_monde?: boolean }) =>
+	permissionsCall<{ dry_run: boolean; command: string; warnings?: string[]; requires_confirmation?: boolean }>('delegate', params);
 export const applyPreset = (dataset: string, preset: string, dryRun: boolean) =>
 	permissionsCall<{ dry_run: boolean; changes: { prop: string; from: string; to: string; note?: string }[]; commands: string[]; notes: string[]; errors?: { command: string; error: string }[] }>('preset', { dataset, preset, dry_run: dryRun });
 /** Teste un texte nfs4_setfacl : représentable en POSIX par knfsd ? */

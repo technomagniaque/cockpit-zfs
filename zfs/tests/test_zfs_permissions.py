@@ -1139,6 +1139,28 @@ class NfsDatasetsTest(unittest.TestCase):
         self.assertFalse(d["ok"])
         self.assertIn(self.p("child"), d["error"])
 
+    def test_delegation_tout_le_monde_dangereuse(self):
+        d = self.ok("delegate", dataset="tank/data", kind="everyone", perms=["snapshot", "receive", "@lot"], dry_run=True)
+        self.assertTrue(d["requires_confirmation"])
+        self.assertIn("receive", d["warnings"][0])
+        self.assertIn("@lot", d["warnings"][0])
+        self.assertEqual(d["command"], "zfs allow -e -- snapshot,receive,@lot tank/data")
+        # exécution sans confirmation : refusée, zfs n'est pas appelé
+        d = self.call("delegate", dataset="tank/data", kind="everyone", perms=["receive"], dry_run=False)
+        self.assertFalse(d["ok"])
+        self.assertIn("confirmation", d["error"])
+        self.assertNotIn("allow -e", self.readlog())
+        # avec la confirmation explicite : exécutée
+        d = self.ok("delegate", dataset="tank/data", kind="everyone", perms=["receive"], dry_run=False,
+                    confirmer_tout_le_monde=True)
+        self.assertIn("allow -e receive tank/data", self.readlog())
+        # permissions anodines à tout le monde : pas de confirmation
+        d = self.ok("delegate", dataset="tank/data", kind="everyone", perms=["snapshot", "diff"], dry_run=True)
+        self.assertFalse(d["requires_confirmation"])
+        # un utilisateur nommé n'est pas concerné
+        d = self.ok("delegate", dataset="tank/data", kind="group", who="root", perms=["receive"], dry_run=True)
+        self.assertFalse(d["requires_confirmation"])
+
     def test_noms_de_dataset_refuses(self):
         for cmd, params in (("delegation", {"dataset": "-o"}),
                             ("delegate", {"dataset": "-r", "kind": "everyone", "perms": ["diff"]}),

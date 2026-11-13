@@ -48,6 +48,14 @@ Dans l'interface, « Appliquer » lance toujours une simulation ; la confirmatio
 qu'après une simulation réussie et se désarme dès qu'une option ou la portée change.
 Les liens symboliques du contenu ne sont pas cliquables. Les délégations `zfs allow` sont
 en simulation par défaut côté backend.
+Déléguer à **tout le monde** (`zfs allow -e`) l'une des permissions `allow`, `receive`, `setuid`,
+`devices`, `create`, `mount`, `destroy`, `rename`, `promote`, `clone`, `zoned` ou un `@ensemble`
+(contenu modifiable après coup) est refusé par le backend sans le paramètre explicite
+`confirmer_tout_le_monde: true` : un utilisateur quelconque pourrait sinon recevoir un flux contenant
+des binaires setuid ou des périphériques, créer et monter des datasets ou redéléguer ces droits.
+La simulation renvoie `warnings` et `requires_confirmation` ; l'interface affiche l'avertissement et
+n'active « Déléguer » qu'après la case de confirmation. Tous les noms de dataset sont validés et passés
+après `--`.
 
 ## Portée commune
 

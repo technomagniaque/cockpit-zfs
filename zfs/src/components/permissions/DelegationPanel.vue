@@ -68,8 +68,20 @@
 					<div class="font-mono text-xs text-muted mt-1">{{ known.join(', ') }}</div>
 				</details>
 			</div>
+			<div v-if="dangerousForEveryone.length" class="rounded-md border border-red-600 p-2 text-danger space-y-1">
+				<div class="font-semibold">Délégation dangereuse à tout le monde</div>
+				<div>
+					N'importe quel utilisateur du système pourra utiliser <span class="font-mono">{{ dangerousForEveryone.join(', ') }}</span>
+					sur ce dataset : recevoir un flux contenant des binaires setuid ou des périphériques, créer et monter des datasets,
+					détruire ou renommer des données, ou redéléguer ces droits. Préférez un utilisateur ou un groupe.
+				</div>
+				<label class="flex flex-row gap-2 items-center">
+					<input type="checkbox" v-model="confirmEveryone" />
+					<span>Je confirme vouloir déléguer ces permissions à tout le monde</span>
+				</label>
+			</div>
 			<div class="flex flex-row gap-2 items-center">
-				<button class="btn btn-primary" :disabled="busy" @click="submit">Déléguer</button>
+				<button class="btn btn-primary" :disabled="busy || (dangerousForEveryone.length > 0 && !confirmEveryone)" @click="submit">Déléguer</button>
 				<span v-if="preview" class="font-mono text-xs text-muted">{{ preview }}</span>
 			</div>
 		</div>
@@ -79,7 +91,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch } from 'vue';
 import { pushNotification, Notification } from '@45drives/houston-common-ui';
-import { type DelegationEntry, getDelegation, delegate } from '../../composables/permissions';
+import { type DelegationEntry, getDelegation, delegate, EVERYONE_DANGEROUS_PERMS } from '../../composables/permissions';
 
 const props = defineProps<{ dataset: string }>();
 
@@ -92,6 +104,12 @@ const form = reactive({ kind: 'user' as 'user' | 'group' | 'everyone' | 'create'
 const quick = ['snapshot', 'mount', 'send', 'receive', 'hold', 'release', 'create', 'destroy', 'rollback', 'clone', 'promote', 'rename', 'diff', 'userprop', 'load-key', 'change-key', 'compression', 'quota'];
 
 const allPerms = computed(() => [...form.perms, ...extra.value.split(',').map((s) => s.trim()).filter(Boolean)]);
+const confirmEveryone = ref(false);
+/** Permissions dangereuses demandées pour « tout le monde » (les @ensembles comptent : leur contenu peut changer). */
+const dangerousForEveryone = computed(() => form.kind === 'everyone'
+	? allPerms.value.filter((p) => EVERYONE_DANGEROUS_PERMS.includes(p) || p.startsWith('@'))
+	: []);
+watch(dangerousForEveryone, (list) => { if (!list.length) confirmEveryone.value = false; });
 const preview = ref('');
 
 function togglePerm(p: string) {
@@ -160,10 +178,14 @@ async function revoke(section: SectionKey, row: Row) {
 async function submit() {
 	busy.value = true;
 	try {
-		const r = await delegate({ dataset: props.dataset, op: 'allow', kind: form.kind, who: form.who, scope: form.scope, perms: allPerms.value, dry_run: false });
-		pushNotification(new Notification('Délégation ajoutée', r.command, 'success', 5000));
+		const r = await delegate({
+			dataset: props.dataset, op: 'allow', kind: form.kind, who: form.who, scope: form.scope, perms: allPerms.value, dry_run: false,
+			confirmer_tout_le_monde: dangerousForEveryone.value.length > 0 && confirmEveryone.value,
+		});
+		pushNotification(new Notification('Délégation ajoutée', r.command, r.warnings?.length ? 'warning' : 'success', 5000));
 		form.perms = [];
 		extra.value = '';
+		confirmEveryone.value = false;
 		await load();
 	} catch (e: any) {
 		pushNotification(new Notification('Délégation impossible', e.message, 'error', 8000));

@@ -61,6 +61,7 @@
 					</div>
 				</div>
 				<AclEditor :path="state.path" :acl="state.acl" :aclMode="state.acl_mode" :isDir="state.info.type === 'dir'" @changed="inspect" />
+				<Nfs4Panel :view="state.nfs4_view" :path="state.path" :isDir="state.info.type === 'dir'" />
 				<details v-if="state.children.length" class="text-sm">
 					<summary class="cursor-pointer text-default font-medium">Contenu ({{ state.children.length }})</summary>
 					<table class="w-full mt-1 text-xs">
@@ -68,7 +69,7 @@
 						<tbody>
 							<tr v-for="c in state.children" :key="c.path" class="border-t border-default"
 								:class="c.type === 'dir' || c.type === 'file' ? 'hover:bg-accent cursor-pointer' : 'text-muted'"
-								:title="c.type === 'link' ? 'Lien symbolique : non suivi' : ''"
+								:title="c.type === 'link' ? 'Lien symbolique : non suivi' : c.nfs4_text ? 'Vue NFSv4 :\n' + c.nfs4_text.join('\n') : ''"
 								@click="(c.type === 'dir' || c.type === 'file') && open(c.path)">
 								<td class="font-mono py-0.5 text-default">{{ basename(c.path) }}{{ c.type === 'dir' ? '/' : c.type === 'link' ? ' →' : '' }}</td>
 								<td class="font-mono text-default">{{ c.symbolic }}</td>
@@ -99,6 +100,20 @@
 					<div class="text-default">
 						{{ auditResult.total }} objets ({{ auditResult.dirs }} dossiers, {{ auditResult.files }} fichiers)
 						<span v-if="auditResult.truncated" class="text-warning">— tronqué</span>
+					</div>
+					<div v-if="auditResult.nfs4" class="rounded border border-default p-2 space-y-1">
+						<div class="font-medium text-default">NFSv4.1</div>
+						<div class="text-default">
+							Domaine <span class="font-mono">{{ auditResult.nfs4.domain }}</span> ({{ auditResult.nfs4.domain_source }}) —
+							nfs4_disable_idmapping :
+							<span class="font-mono">{{ auditResult.nfs4.disable_idmapping === null ? 'nfsd non chargé' : auditResult.nfs4.disable_idmapping ? 'Y' : 'N' }}</span>
+							— acltype <span class="font-mono">{{ auditResult.nfs4.acltype }}</span>,
+							xattr <span class="font-mono">{{ auditResult.nfs4.xattr }}</span>
+						</div>
+						<div class="text-muted">{{ auditResult.nfs4.native.message }}</div>
+						<ul v-if="auditResult.nfs4.notes.length" class="list-disc pl-5 text-warning">
+							<li v-for="n in auditResult.nfs4.notes" :key="n">{{ n }}</li>
+						</ul>
 					</div>
 					<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
 						<details v-for="(label, key) in findingLabels" :key="key" class="rounded border border-default p-2"
@@ -197,6 +212,7 @@ import { pushNotification, Notification } from '@45drives/houston-common-ui';
 import type { ZFSFileSystemInfo } from '@45drives/houston-common-lib';
 import Card from '../common/Card.vue';
 import AclEditor from './AclEditor.vue';
+import Nfs4Panel from './Nfs4Panel.vue';
 import ResetPanel from './ResetPanel.vue';
 import DelegationPanel from './DelegationPanel.vue';
 import {
@@ -255,6 +271,7 @@ function open(p: string) {
 const basename = (p: string) => p.split('/').pop();
 const flags = (c: PathInfo) => [
 	c.setgid && 'setgid', c.sticky && 'sticky', c.has_posix_acl && 'ACL', c.has_ntacl && 'NTACL', c.immutable && 'immutable',
+	c.nfs4_deny && 'DENY NFSv4',
 ].filter(Boolean).join(' ');
 
 // ---- audit
@@ -272,6 +289,9 @@ const findingLabels: Record<string, string> = {
 	ntacl: 'Avec ACL NT (security.NTACL)',
 	immutable: 'Immutable / append-only',
 	setuid: 'Fichiers setuid / setgid',
+	nfs4_deny: 'NFSv4 : ACE DENY générées par knfsd',
+	nfs4_over_mask: 'NFSv4 : entrées bornées par le masque',
+	nfs4_unnamed_principal: 'NFSv4 : entrées nommées sans nom (UID/GID)',
 };
 async function audit() {
 	busy.value = true;
@@ -303,7 +323,8 @@ const presets: Record<string, string> = {
 	'posixacl-smb': 'ACL POSIX pour SMB (Samba / ksmbd acl_xattr)',
 	'noacl-unix': 'Droits Unix seulement (noacl)',
 	'macos-smb': 'Partage fréquenté par macOS',
-	'nfsv4': 'ACL NFSv4 (FreeBSD / TrueNAS seulement)',
+	'nfsv4-posix': 'Partage NFSv4.1 sur OpenZFS Linux (ACL POSIX traduites par knfsd)',
+	'nfsv4': 'ACL NFSv4 natives (FreeBSD / TrueNAS seulement)',
 };
 const preset = ref('posixacl-smb');
 const presetPlan = ref<Awaited<ReturnType<typeof applyPreset>> | null>(null);

@@ -99,8 +99,12 @@ PRESETS = {
         "label": "Partage fréquenté par macOS (streams en xattr SA)",
         "props": {"xattr": "sa", "dnodesize": "auto", "normalization": None},
     },
+    "nfsv4-posix": {
+        "label": "Partage NFSv4.1 sur OpenZFS Linux (ACL POSIX traduites par knfsd)",
+        "props": {"acltype": "posixacl", "xattr": "sa", "dnodesize": "auto"},
+    },
     "nfsv4": {
-        "label": "ACL NFSv4 (FreeBSD / forks TrueNAS seulement)",
+        "label": "ACL NFSv4 natives (FreeBSD / forks TrueNAS seulement)",
         "props": {"acltype": "nfsv4", "aclmode": "passthrough", "aclinherit": "passthrough", "xattr": "sa"},
     },
 }
@@ -435,6 +439,540 @@ def resolve_x_acl(acl, is_dir, st_mode):
     if is_dir or st_mode & 0o111:
         return acl
     return [(t, p & 6, i) for (t, p, i) in acl]
+
+
+# --------------------------------------------------------------------------- NFSv4 (traduction knfsd)
+#
+# Reproduction de fs/nfsd/nfs4acl.c (Linux) : knfsd stocke des ACL POSIX et les
+# présente aux clients NFSv4 comme des ACL NFSv4 (_posix_to_nfsv4_one), puis
+# retraduit en POSIX les ACL posées par nfs4_setfacl (nfs4_acl_nfsv4_to_posix).
+# OpenZFS upstream sous Linux n'a pas d'ACL NFSv4 natives (acltype=nfsv4).
+
+NFS4_ACE_ALLOW, NFS4_ACE_DENY, NFS4_ACE_AUDIT, NFS4_ACE_ALARM = 0, 1, 2, 3
+F_FILE_INHERIT, F_DIR_INHERIT, F_NO_PROPAGATE, F_INHERIT_ONLY = 0x1, 0x2, 0x4, 0x8
+F_SUCCESS, F_FAILED, F_GROUP = 0x10, 0x20, 0x40
+M_READ_DATA, M_WRITE_DATA, M_APPEND_DATA = 0x1, 0x2, 0x4
+M_READ_NAMED, M_WRITE_NAMED, M_EXECUTE, M_DELETE_CHILD = 0x8, 0x10, 0x20, 0x40
+M_READ_ATTR, M_WRITE_ATTR = 0x80, 0x100
+M_DELETE, M_READ_ACL, M_WRITE_ACL, M_WRITE_OWNER, M_SYNCHRONIZE = 0x10000, 0x20000, 0x40000, 0x80000, 0x100000
+
+NFS4_READ_MODE = M_READ_DATA
+NFS4_WRITE_MODE = M_WRITE_DATA | M_APPEND_DATA
+NFS4_EXECUTE_MODE = M_EXECUTE
+NFS4_ANYONE_MODE = M_READ_ATTR | M_READ_ACL | M_SYNCHRONIZE
+NFS4_OWNER_MODE = M_WRITE_ATTR | M_WRITE_ACL
+NFS4_INHERITANCE_FLAGS = F_FILE_INHERIT | F_DIR_INHERIT
+NFS4_SUPPORTED_FLAGS = NFS4_INHERITANCE_FLAGS | F_INHERIT_ONLY | F_GROUP
+
+# ordre d'affichage de nfs4_getfacl (nfs4-acl-tools)
+NFS4_PERM_LETTERS = [("r", M_READ_DATA), ("w", M_WRITE_DATA), ("a", M_APPEND_DATA), ("D", M_DELETE_CHILD),
+                     ("d", M_DELETE), ("x", M_EXECUTE), ("t", M_READ_ATTR), ("T", M_WRITE_ATTR),
+                     ("n", M_READ_NAMED), ("N", M_WRITE_NAMED), ("c", M_READ_ACL), ("C", M_WRITE_ACL),
+                     ("o", M_WRITE_OWNER), ("y", M_SYNCHRONIZE)]
+NFS4_FLAG_LETTERS = [("f", F_FILE_INHERIT), ("d", F_DIR_INHERIT), ("n", F_NO_PROPAGATE), ("i", F_INHERIT_ONLY),
+                     ("S", F_SUCCESS), ("F", F_FAILED), ("g", F_GROUP)]
+NFS4_TYPE_LETTERS = {"A": NFS4_ACE_ALLOW, "D": NFS4_ACE_DENY, "U": NFS4_ACE_AUDIT, "L": NFS4_ACE_ALARM}
+NFS4_SPECIAL_WHO = ("OWNER@", "GROUP@", "EVERYONE@")
+
+
+def _mask_from_posix(perm, is_dir, owner=False):
+    mask = NFS4_ANYONE_MODE
+    if owner:
+        mask |= NFS4_OWNER_MODE
+    if perm & 4:
+        mask |= NFS4_READ_MODE
+    if perm & 2:
+        mask |= NFS4_WRITE_MODE
+        if is_dir:
+            mask |= M_DELETE_CHILD
+    if perm & 1:
+        mask |= NFS4_EXECUTE_MODE
+    return mask
+
+
+def _deny_mask_from_posix(perm, is_dir):
+    mask = 0
+    if perm & 4:
+        mask |= NFS4_READ_MODE
+    if perm & 2:
+        mask |= NFS4_WRITE_MODE
+        if is_dir:
+            mask |= M_DELETE_CHILD
+    if perm & 1:
+        mask |= NFS4_EXECUTE_MODE
+    return mask
+
+
+def _posix_sorted(acl):
+    return sorted(acl, key=lambda e: (e[0], e[2] if e[2] is not None else -1))
+
+
+def posix_to_nfs4(acl, is_dir, default=False):
+    """_posix_to_nfsv4_one() : ACL POSIX (liste (tag, perm, id)) → ACE NFSv4.
+    Chaque ACE : {type, flag, mask, who ('OWNER@'|'GROUP@'|'EVERYONE@'|'named'), id, group}."""
+    acl = _posix_sorted(acl)
+    if len(acl) < 3:
+        return []
+    owner = users = group = groups = other = 0
+    mask = 7
+    for tag, perm, _i in acl:
+        if tag == ACL_USER_OBJ:
+            owner = perm
+        elif tag == ACL_GROUP_OBJ:
+            group = perm
+        elif tag == ACL_USER:
+            users |= perm
+        elif tag == ACL_GROUP:
+            groups |= perm
+        elif tag == ACL_OTHER:
+            other = perm
+        elif tag == ACL_MASK:
+            mask = perm
+    users &= mask
+    group &= mask
+    groups &= mask
+    eflag = (NFS4_INHERITANCE_FLAGS | F_INHERIT_ONLY) if default else 0
+    out = []
+
+    def ace(t, flag, m, who, ident=None, grp=False):
+        out.append({"type": t, "flag": flag, "mask": m, "who": who, "id": ident, "group": grp})
+
+    deny = (~owner) & (users | group | groups | other) & 7
+    if deny:
+        ace(NFS4_ACE_DENY, eflag, _deny_mask_from_posix(deny, is_dir), "OWNER@")
+    ace(NFS4_ACE_ALLOW, eflag, _mask_from_posix(owner, is_dir, owner=True), "OWNER@")
+    for tag, perm, ident in acl:
+        if tag != ACL_USER:
+            continue
+        deny = (~(perm & mask)) & (groups | group | other) & 7
+        if deny:
+            ace(NFS4_ACE_DENY, eflag, _deny_mask_from_posix(deny, is_dir), "named", ident)
+        ace(NFS4_ACE_ALLOW, eflag, _mask_from_posix(perm & mask, is_dir), "named", ident)
+    # groupes : d'abord les ALLOW, puis les DENY (un utilisateur peut être dans plusieurs groupes)
+    ace(NFS4_ACE_ALLOW, eflag, _mask_from_posix(group, is_dir), "GROUP@")
+    named_groups = [(perm, ident) for tag, perm, ident in acl if tag == ACL_GROUP]
+    for perm, ident in named_groups:
+        ace(NFS4_ACE_ALLOW, eflag | F_GROUP, _mask_from_posix(perm & mask, is_dir), "named", ident, True)
+    deny = (~group) & other & 7
+    if deny:
+        ace(NFS4_ACE_DENY, eflag, _deny_mask_from_posix(deny, is_dir), "GROUP@")
+    for perm, ident in named_groups:
+        deny = (~(perm & mask)) & other & 7
+        if deny:
+            ace(NFS4_ACE_DENY, eflag | F_GROUP, _deny_mask_from_posix(deny, is_dir), "named", ident, True)
+    ace(NFS4_ACE_ALLOW, eflag, _mask_from_posix(other, is_dir), "EVERYONE@")
+    return out
+
+
+def nfs4_view(access, default, is_dir):
+    """nfsd4_get_nfs4_acl() : ACL d'accès puis ACL par défaut (dossiers seulement)."""
+    aces = posix_to_nfs4(access, is_dir)
+    if is_dir and default:
+        aces += posix_to_nfs4(default, is_dir, default=True)
+    return aces
+
+
+_idmap_cache = {}
+
+
+def idmap_info():
+    """Domaine NFSv4 (idmapd.conf, sinon domaine DNS) et nfs4_disable_idmapping de nfsd."""
+    if "info" in _idmap_cache:
+        return _idmap_cache["info"]
+    domain, source = None, None
+    try:
+        section = None
+        with open(os.environ.get("COCKPIT_ZFS_IDMAPD_CONF", "/etc/idmapd.conf"), errors="replace") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line.startswith("["):
+                    section = line.strip("[]").strip().lower()
+                elif section == "general" and "=" in line:
+                    k, v = line.split("=", 1)
+                    if k.strip().lower() == "domain" and v.strip():
+                        domain, source = v.strip(), "idmapd.conf"
+    except OSError:
+        pass
+    if not domain:
+        import socket
+        fqdn = socket.getfqdn()
+        if "." in fqdn:
+            domain, source = fqdn.split(".", 1)[1], "domaine DNS"
+        else:
+            domain, source = "localdomain", "défaut (aucun domaine trouvé)"
+    disable = None
+    try:
+        with open("/sys/module/nfsd/parameters/nfs4_disable_idmapping") as f:
+            disable = f.read().strip().upper().startswith("Y")
+    except OSError:
+        pass
+    info = {"domain": domain, "domain_source": source, "disable_idmapping": disable,
+            "nfsd_loaded": disable is not None}
+    _idmap_cache["info"] = info
+    return info
+
+
+def nfs4_principal(a, numeric=False):
+    if a["who"] != "named":
+        return a["who"]
+    if numeric:
+        return str(a["id"])
+    name = gid_name(a["id"]) if a["group"] else uid_name(a["id"])
+    if name is None:
+        return str(a["id"])
+    return "%s@%s" % (name, idmap_info()["domain"])
+
+
+def nfs4_ace_text(a, is_dir, numeric=False):
+    t = {v: k for k, v in NFS4_TYPE_LETTERS.items()}.get(a["type"], "?")
+    flags = "".join(c for c, b in NFS4_FLAG_LETTERS if a["flag"] & b)
+    perms = "".join(c for c, b in NFS4_PERM_LETTERS
+                    if a["mask"] & b and (c != "D" or is_dir))  # nfs4_getfacl masque D sur un fichier
+    return "%s:%s:%s:%s" % (t, flags, nfs4_principal(a, numeric), perms)
+
+
+def nfs4_render(aces, is_dir, numeric=False):
+    return [nfs4_ace_text(a, is_dir, numeric) for a in aces]
+
+
+def nfs4_explain(acl, default, is_dir):
+    """Explications en français des ACE DENY générées et des droits bornés par le masque."""
+    notes = []
+    for label, a in (("accès", acl), ("défaut", default)):
+        if not a:
+            continue
+        mask = acl_get(a, ACL_MASK)
+        aces = posix_to_nfs4(a, is_dir, default=(label == "défaut"))
+        for x in aces:
+            if x["type"] != NFS4_ACE_DENY:
+                continue
+            who = nfs4_principal(x)
+            if x["who"] == "OWNER@":
+                notes.append("[%s] DENY OWNER@ : le propriétaire a moins de droits qu'une autre classe ; "
+                             "knfsd refuse explicitement ces droits au propriétaire avant les ALLOW suivants." % label)
+            elif x["who"] == "GROUP@":
+                notes.append("[%s] DENY GROUP@ : « autres » a plus de droits que le groupe propriétaire ; "
+                             "un membre du groupe est donc refusé là où un inconnu serait accepté." % label)
+            else:
+                notes.append("[%s] DENY %s : cette entrée nommée a moins de droits qu'une classe suivante "
+                             "(groupe ou autres) ; knfsd ajoute un refus pour garder la sémantique POSIX." % (label, who))
+        if mask is not None:
+            for tag, perm, ident in a:
+                if tag in (ACL_USER, ACL_GROUP, ACL_GROUP_OBJ) and perm & ~mask & 7:
+                    nm = "groupe propriétaire" if tag == ACL_GROUP_OBJ else (
+                        (uid_name(ident) if tag == ACL_USER else gid_name(ident)) or str(ident))
+                    notes.append("[%s] %s : droits stockés %s bornés par le masque %s, le client NFSv4 ne voit que %s"
+                                 % (label, nm, _rwx(perm), _rwx(mask), _rwx(perm & mask)))
+    return notes
+
+
+def _rwx(p):
+    return ("r" if p & 4 else "-") + ("w" if p & 2 else "-") + ("x" if p & 1 else "-")
+
+
+def nfs4_view_for(access, default, is_dir, numeric=False):
+    aces = nfs4_view(access, default, is_dir)
+    return {
+        "aces": [dict(a, text=nfs4_ace_text(a, is_dir, numeric)) for a in aces],
+        "text": nfs4_render(aces, is_dir, numeric),
+        "deny_count": sum(1 for a in aces if a["type"] == NFS4_ACE_DENY),
+        "notes": nfs4_explain(access, default if is_dir else [], is_dir),
+    }
+
+
+# ---- sens inverse : nfs4_setfacl → POSIX (nfs4_acl_nfsv4_to_posix)
+
+NFS4_PERM_PARSE = {c: b for c, b in NFS4_PERM_LETTERS}
+# alias de nfs4_setfacl 0.3.x, valeurs relevées sur l'outil réel (XDR envoyé) :
+# R = 0x120089, W = 0x160196 (+ D sur un dossier), X = 0x1200a0
+NFS4_PERM_ALIASES = {
+    "R": M_READ_DATA | M_READ_NAMED | M_READ_ATTR | M_READ_ACL | M_SYNCHRONIZE,
+    "W": M_WRITE_DATA | M_APPEND_DATA | M_WRITE_NAMED | M_READ_ATTR | M_WRITE_ATTR | M_READ_ACL
+    | M_WRITE_ACL | M_SYNCHRONIZE,
+    "X": M_EXECUTE | M_READ_ATTR | M_READ_ACL | M_SYNCHRONIZE,
+}
+# nfs4_setfacl écrit « n » pour no-propagate et refuse « p » (« Bad Ace Flag:p ») malgré son aide
+NFS4_FLAG_PARSE = {"f": F_FILE_INHERIT, "d": F_DIR_INHERIT, "n": F_NO_PROPAGATE,
+                   "i": F_INHERIT_ONLY, "S": F_SUCCESS, "F": F_FAILED, "g": F_GROUP}
+
+
+def parse_nfs4_text(text, is_dir=True, client_filter=True, notes=None):
+    """Analyse un texte au format nfs4_setfacl (ACE séparées par virgules, espaces ou lignes).
+
+    client_filter : reproduit le filtrage de nfs4_setfacl avant envoi (sur un fichier, il retire
+    silencieusement f, d, n, i et le bit D). Un autre client (Windows, macOS) envoie l'ACE telle quelle."""
+    aces = []
+    for raw in re.split(r"[,\s]+", text or ""):
+        tok = raw.strip()
+        if not tok or tok.startswith("#"):
+            continue
+        parts = tok.split(":")
+        if len(parts) != 4:
+            raise PermError("ACE illisible : %r (format type:flags:principal:perms)" % tok)
+        t, fl, who, perms = parts
+        if t not in NFS4_TYPE_LETTERS:
+            raise PermError("Type d'ACE inconnu %r dans %r (A, D, U ou L)" % (t, tok))
+        flag = 0
+        for c in fl:
+            if c not in NFS4_FLAG_PARSE:
+                raise PermError("Drapeau inconnu %r dans %r (nfs4_setfacl : « Bad Ace Flag:%s »%s)"
+                                % (c, tok, c, " ; no-propagate s'écrit n" if c == "p" else ""))
+            flag |= NFS4_FLAG_PARSE[c]
+        mask = 0
+        for c in perms:
+            if c in NFS4_PERM_PARSE:
+                mask |= NFS4_PERM_PARSE[c]
+            elif c in NFS4_PERM_ALIASES:
+                mask |= NFS4_PERM_ALIASES[c]
+                if c == "W" and is_dir:
+                    mask |= M_DELETE_CHILD
+            else:
+                raise PermError("Permission inconnue %r dans %r" % (c, tok))
+        if not who:
+            raise PermError("Principal vide dans %r" % tok)
+        if client_filter and who == "GROUP@":
+            flag |= F_GROUP  # nfs4_setfacl marque toujours GROUP@ comme groupe
+        if client_filter and not is_dir:
+            dropped_f = flag & (NFS4_INHERITANCE_FLAGS | F_NO_PROPAGATE | F_INHERIT_ONLY)
+            if dropped_f or mask & M_DELETE_CHILD:
+                if notes is not None:
+                    notes.append("%s : nfs4_setfacl retire sur un fichier les drapeaux d'héritage et le bit D "
+                                 "avant l'envoi" % tok)
+                flag &= ~(NFS4_INHERITANCE_FLAGS | F_NO_PROPAGATE | F_INHERIT_ONLY)
+                mask &= ~M_DELETE_CHILD
+        aces.append({"type": NFS4_TYPE_LETTERS[t], "flag": flag, "mask": mask, "principal": who, "text": tok})
+    if not aces:
+        raise PermError("Aucune ACE")
+    return aces
+
+
+def _resolve_principal(principal, is_group):
+    """Comme l'idmapping de knfsd : OWNER@/GROUP@/EVERYONE@, nom@domaine, ou identifiant
+    numérique (accepté quand nfs4_disable_idmapping est actif)."""
+    if principal in NFS4_SPECIAL_WHO:
+        return {"OWNER@": "OWNER@", "GROUP@": "GROUP@", "EVERYONE@": "EVERYONE@"}[principal], None, None
+    if principal.isdigit():
+        return "named", int(principal), None
+    name, _, dom = principal.partition("@")
+    note = None
+    info = idmap_info()
+    if dom and dom.lower() != info["domain"].lower():
+        note = ("domaine %s différent du domaine NFSv4 du serveur (%s) : nfsidmap le refusera "
+                "(NFS4ERR_BADOWNER)" % (dom, info["domain"]))
+    try:
+        ident = grp.getgrnam(name).gr_gid if is_group else pwd.getpwnam(name).pw_uid
+    except KeyError:
+        raise PermError("%s %s inconnu sur le serveur : le client recevrait NFS4ERR_BADOWNER"
+                        % ("groupe" if is_group else "utilisateur", name))
+    return "named", ident, note
+
+
+class _AceState:
+    __slots__ = ("allow", "deny")
+
+    def __init__(self, allow=0, deny=0):
+        self.allow, self.deny = allow, deny
+
+    def allow_bits(self, m):
+        self.allow |= m & ~self.deny
+
+    def deny_bits(self, m):
+        self.deny |= m & ~self.allow
+
+
+class _PosixState:
+    def __init__(self):
+        self.valid = 0
+        self.owner, self.group, self.other, self.everyone = _AceState(), _AceState(), _AceState(), _AceState()
+        self.mask = _AceState()
+        self.users = []   # [(uid, _AceState)]
+        self.groups = []
+
+    def find(self, arr, ident):
+        for i, st in arr:
+            if i == ident:
+                return st
+        st = _AceState(self.everyone.allow, self.everyone.deny)
+        arr.append((ident, st))
+        return st
+
+
+def _process_ace(state, who, ident, is_group, atype, mask):
+    """process_one_v4_ace()."""
+    if who == "OWNER@":
+        typ = ACL_USER_OBJ
+    elif who == "GROUP@":
+        typ = ACL_GROUP_OBJ
+    elif who == "EVERYONE@":
+        typ = ACL_OTHER
+    else:
+        typ = ACL_GROUP if is_group else ACL_USER
+    state.valid |= typ
+    allow = atype == NFS4_ACE_ALLOW
+    if typ == ACL_USER_OBJ:
+        (state.owner.allow_bits if allow else state.owner.deny_bits)(mask)
+    elif typ == ACL_USER:
+        st = state.find(state.users, ident)
+        if allow:
+            st.allow_bits(mask)
+        else:
+            st.deny_bits(mask)
+            state.owner.deny_bits(st.deny)
+    elif typ == ACL_GROUP_OBJ:
+        if allow:
+            state.group.allow_bits(mask)
+        else:
+            state.group.deny_bits(mask)
+            m = state.group.deny
+            state.owner.deny_bits(m)
+            state.everyone.deny_bits(m)
+            for _i, s in state.users + state.groups:
+                s.deny_bits(m)
+    elif typ == ACL_GROUP:
+        st = state.find(state.groups, ident)
+        if allow:
+            st.allow_bits(mask)
+        else:
+            st.deny_bits(mask)
+            m = st.deny
+            state.owner.deny_bits(m)
+            state.group.deny_bits(m)
+            state.everyone.deny_bits(m)
+            for _i, s in state.users + state.groups:
+                s.deny_bits(m)
+    else:  # ACL_OTHER
+        targets = [state.owner, state.group, state.other, state.everyone] + [s for _i, s in state.users + state.groups]
+        for s in targets:
+            (s.allow_bits if allow else s.deny_bits)(mask)
+
+
+def _low_mode(perm, is_dir):
+    """low_mode_from_nfs4() : pessimiste, tous les bits requis pour accorder rwx."""
+    write_mode = NFS4_WRITE_MODE | (M_DELETE_CHILD if is_dir else 0)
+    mode = 0
+    if perm & NFS4_READ_MODE == NFS4_READ_MODE:
+        mode |= 4
+    if perm & write_mode == write_mode:
+        mode |= 2
+    if perm & NFS4_EXECUTE_MODE == NFS4_EXECUTE_MODE:
+        mode |= 1
+    return mode
+
+
+def _state_to_acl(state, is_dir, default=False):
+    """posix_state_to_acl() puis sort_pacl()."""
+    if not state.valid and default:
+        return None
+    acl = [(ACL_USER_OBJ, _low_mode(state.owner.allow, is_dir), None)]
+    for ident, s in state.users:
+        acl.append((ACL_USER, _low_mode(s.allow, is_dir), ident))
+        state.mask.allow |= s.allow
+    acl.append((ACL_GROUP_OBJ, _low_mode(state.group.allow, is_dir), None))
+    state.mask.allow |= state.group.allow
+    for ident, s in state.groups:
+        acl.append((ACL_GROUP, _low_mode(s.allow, is_dir), ident))
+        state.mask.allow |= s.allow
+    if state.users or state.groups:
+        acl.append((ACL_MASK, _low_mode(state.mask.allow, is_dir), None))
+    acl.append((ACL_OTHER, _low_mode(state.other.allow, is_dir), None))
+    return _posix_sorted(acl)
+
+
+def nfs4_to_posix(text, is_dir, client_filter=True):
+    """nfs4_acl_nfsv4_to_posix() appliqué à un texte nfs4_setfacl.
+    Retourne {representable, error, access, default, mode, readback, notes}."""
+    notes = []
+    aces = parse_nfs4_text(text, is_dir, client_filter, notes)
+    eff, dfl = _PosixState(), _PosixState()
+    ignored = 0
+    for a in aces:
+        if a["type"] not in (NFS4_ACE_ALLOW, NFS4_ACE_DENY):
+            return {"representable": False, "aces": aces,
+                    "error": "ACE d'audit / d'alarme (%s) non gérée : knfsd renvoie EINVAL, le client voit "
+                             "NFS4ERR_ATTRNOTSUPP" % a["text"]}
+        if a["flag"] & ~NFS4_SUPPORTED_FLAGS:
+            bad = "".join(c for c, b in NFS4_FLAG_LETTERS if a["flag"] & ~NFS4_SUPPORTED_FLAGS & b)
+            return {"representable": False, "aces": aces,
+                    "error": "Drapeau(x) « %s » non géré(s) dans %s (seuls f, d, i, g sont acceptés) : "
+                             "EINVAL → NFS4ERR_ATTRNOTSUPP" % (bad, a["text"])}
+        if a["flag"] & NFS4_INHERITANCE_FLAGS and not is_dir:
+            return {"representable": False, "aces": aces,
+                    "error": "Drapeaux d'héritage sur un fichier (%s) : EINVAL → NFS4ERR_ATTRNOTSUPP" % a["text"]}
+        who, ident, note = _resolve_principal(a["principal"], bool(a["flag"] & F_GROUP))
+        if note:
+            notes.append(note)
+        if (a["flag"] & F_GROUP) and a["principal"] in ("OWNER@", "EVERYONE@"):
+            notes.append("drapeau g ignoré pour %s" % who)
+        mapped = NFS4_READ_MODE | NFS4_WRITE_MODE | NFS4_EXECUTE_MODE | (M_DELETE_CHILD if is_dir else 0)
+        ignored |= a["mask"] & ~mapped
+        if a["flag"] & NFS4_INHERITANCE_FLAGS == 0:
+            _process_ace(eff, who, ident, bool(a["flag"] & F_GROUP), a["type"], a["mask"])
+            continue
+        if bool(a["flag"] & F_FILE_INHERIT) != bool(a["flag"] & F_DIR_INHERIT):
+            notes.append("%s : un seul des drapeaux f / d → knfsd active les deux (ACL par défaut POSIX)" % a["text"])
+        _process_ace(dfl, who, ident, bool(a["flag"] & F_GROUP), a["type"], a["mask"])
+        if not a["flag"] & F_INHERIT_ONLY:
+            _process_ace(eff, who, ident, bool(a["flag"] & F_GROUP), a["type"], a["mask"])
+    if dfl.valid:
+        if not dfl.valid & ACL_USER_OBJ:
+            dfl.owner = _AceState(eff.owner.allow, eff.owner.deny)
+        if not dfl.valid & ACL_GROUP_OBJ:
+            dfl.group = _AceState(eff.group.allow, eff.group.deny)
+        if not dfl.valid & ACL_OTHER:
+            dfl.other = _AceState(eff.other.allow, eff.other.deny)
+    access = _state_to_acl(eff, is_dir)
+    default = _state_to_acl(dfl, is_dir, default=True) if is_dir else None
+    if ignored:
+        notes.append("Bits sans équivalent POSIX ignorés : %s (seuls r, w+a%s, x comptent ; t, T, c, C, o, y, d, n, N "
+                     "sont reconstruits par le serveur)" % (
+                         "".join(c for c, b in NFS4_PERM_LETTERS if ignored & b), "+D" if is_dir else ""))
+    for a in aces:
+        need = NFS4_WRITE_MODE | (M_DELETE_CHILD if is_dir else 0)
+        if a["type"] == NFS4_ACE_ALLOW and a["mask"] & NFS4_WRITE_MODE and a["mask"] & need != need:
+            notes.append("%s : w sans %s → l'écriture n'est PAS accordée en POSIX (conversion pessimiste)"
+                         % (a["text"], "a et D" if is_dir else "a"))
+    mode = None
+    if access:
+        g = acl_get(access, ACL_MASK)
+        mode = (acl_get(access, ACL_USER_OBJ) << 6) | ((g if g is not None else acl_get(access, ACL_GROUP_OBJ)) << 3) \
+            | acl_get(access, ACL_OTHER)
+    readback = nfs4_view(access, default or [], is_dir)
+    return {"representable": True, "error": None, "aces": aces,
+            "access": acl_to_ui(access), "default": acl_to_ui(default) if default else [],
+            "mode": "%04o" % mode if mode is not None else None,
+            "readback": nfs4_render(readback, is_dir), "notes": notes}
+
+
+def cmd_nfs4_translate(params):
+    """Teste un texte nfs4_setfacl : représentable ? ACL POSIX obtenue ? relecture par le client."""
+    is_dir = params.get("is_dir")
+    if params.get("path") and is_dir is None:
+        target = resolve_target(params)
+        is_dir = stat.S_ISDIR(os.lstat(target.path).st_mode)
+    try:
+        r = nfs4_to_posix(params.get("acl", ""), bool(is_dir if is_dir is not None else True),
+                          client_filter=params.get("client", "nfs4_setfacl") == "nfs4_setfacl")
+    except PermError as e:
+        r = {"representable": False, "error": str(e), "aces": []}
+    r["is_dir"] = bool(is_dir if is_dir is not None else True)
+    r["idmap"] = idmap_info()
+    return r
+
+
+def nfsv4_native_support():
+    """Détection sans rien modifier : OpenZFS upstream Linux n'accepte pas acltype=nfsv4.
+    Indices d'une pile patchée (TrueNAS) : outils nfs4xdr_* ou un dataset déjà en nfsv4."""
+    import shutil
+    hints = [b for b in ("nfs4xdr_getfacl", "nfs4xdr_setfacl") if shutil.which(b)]
+    datasets = []
+    code, out, _e = run(["zfs", "get", "-H", "-o", "name,value", "-t", "filesystem", "acltype"], check=False)
+    if code == 0:
+        datasets = [l.split("\t")[0] for l in out.splitlines() if l.endswith("\tnfsv4")]
+    supported = bool(hints or datasets) or sys.platform.startswith("freebsd")
+    return {"supported": supported, "hints": hints, "datasets": datasets,
+            "message": "ACL NFSv4 natives disponibles (pile patchée détectée)" if supported else
+            "OpenZFS upstream sous Linux : acltype=nfsv4 non supporté (PR openzfs/zfs#16967 non fusionnée). "
+            "Les clients NFSv4 voient les ACL POSIX traduites par knfsd."}
 
 
 # --------------------------------------------------------------------------- ZFS
@@ -851,6 +1389,18 @@ def describe(path, st=None):
     return info
 
 
+def raw_acls_for_path(path, st):
+    """ACL internes (accès, défaut) d'un chemin, sans suivre les liens."""
+    def get(name):
+        try:
+            return os.getxattr(path, name, follow_symlinks=False)
+        except OSError:
+            return None
+    raw_a = get(ACCESS_XATTR)
+    raw_d = get(DEFAULT_XATTR) if stat.S_ISDIR(st.st_mode) else None
+    return (decode_acl(raw_a) if raw_a else base_from_mode(st.st_mode)), (decode_acl(raw_d) if raw_d else [])
+
+
 def acl_for_path(path, st):
     def get(name):
         try:
@@ -888,8 +1438,15 @@ def cmd_inspect(params):
                 if de.name == ".zfs":
                     continue
                 try:
-                    children.append(describe(de.path, de.stat(follow_symlinks=False)))
-                except OSError:
+                    cst = de.stat(follow_symlinks=False)
+                    child = describe(de.path, cst)
+                    if stat.S_ISREG(cst.st_mode) or stat.S_ISDIR(cst.st_mode):
+                        ca, cd = raw_acls_for_path(de.path, cst)
+                        cv = nfs4_view(ca, cd, stat.S_ISDIR(cst.st_mode))
+                        child["nfs4_text"] = nfs4_render(cv, stat.S_ISDIR(cst.st_mode))
+                        child["nfs4_deny"] = sum(1 for a in cv if a["type"] == NFS4_ACE_DENY)
+                    children.append(child)
+                except (OSError, PermError):
                     pass
         except OSError:
             pass
@@ -910,11 +1467,26 @@ def cmd_inspect(params):
         warnings.append("Le chemin demandé contient un lien symbolique : affichage de la cible réelle %s, écriture refusée" % path)
     if target.mountpoint in SYSTEM_MOUNTS:
         warnings.append("Dataset système (monté sur %s) : les modifications sont refusées" % target.mountpoint)
+    nfs4 = None
+    if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
+        try:
+            ra, rd = raw_acls_for_path(path, st)
+            nfs4 = nfs4_view_for(ra, rd, stat.S_ISDIR(st.st_mode))
+            nfs4["numeric_text"] = nfs4_render(nfs4_view(ra, rd, stat.S_ISDIR(st.st_mode)),
+                                               stat.S_ISDIR(st.st_mode), numeric=True)
+            nfs4["idmap"] = idmap_info()
+            if xattr == "dir":
+                nfs4["notes"].append("xattr=dir : chaque ACL est un fichier caché, lent à chaque GETATTR NFS ; préférez xattr=sa")
+            if info["has_ntacl"]:
+                nfs4["notes"].append("security.NTACL (ACL Windows de ksmbd / Samba acl_xattr) est invisible et "
+                                     "non appliquée côté NFS : seules les ACL POSIX comptent pour les clients NFSv4")
+        except PermError as e:
+            nfs4 = {"error": str(e)}
     return {
         "path": path, "dataset": target.dataset, "mountpoint": target.mountpoint,
         "props": props, "info": info, "acl": acl, "acl_error": acl_error,
         "children": children, "warnings": warnings,
-        "acl_mode": acl_mode_for(target.dataset),
+        "acl_mode": acl_mode_for(target.dataset), "nfs4_view": nfs4,
     }
 
 
@@ -926,13 +1498,15 @@ def cmd_audit(params):
         root_setgid = bool(root_st.st_mode & stat.S_ISGID)
         acltype = acl_mode_for(target.dataset)
         kinds = ("world_writable", "orphan_uid", "orphan_gid", "ntacl", "posix_acl", "ignored_posix_acl",
-                 "dir_missing_setgid", "foreign_group", "immutable", "setuid")
+                 "dir_missing_setgid", "foreign_group", "immutable", "setuid",
+                 "nfs4_deny", "nfs4_over_mask", "nfs4_unnamed_principal")
         findings = {k: [] for k in kinds}
         counts = {k: 0 for k in kinds}
         owners, groups, modes = {}, {}, {}
         total = files = dirs = 0
         truncated = False
         check_flags = bool(params.get("check_flags", True))
+        check_nfs4 = bool(params.get("check_nfs4", True))
 
         def add(kind, p):
             counts[kind] += 1
@@ -971,6 +1545,24 @@ def cmd_audit(params):
                 add("ntacl", e.path)
             if ACCESS_XATTR in x or DEFAULT_XATTR in x:
                 add("ignored_posix_acl" if acltype == "off" else "posix_acl", e.path)
+            if check_nfs4:
+                try:
+                    acc = read_access(e.fd, st) if acltype == "posix" else base_from_mode(st.st_mode)
+                    dfl = read_default(e.fd) if (e.is_dir and acltype == "posix") else []
+                except (OSError, PermError):
+                    acc, dfl = base_from_mode(st.st_mode), []
+                view = nfs4_view(acc, dfl, e.is_dir)
+                if any(a["type"] == NFS4_ACE_DENY for a in view):
+                    add("nfs4_deny", e.path)
+                for a in (acc, dfl):
+                    mk = acl_get(a, ACL_MASK)
+                    if mk is not None and any(t in (ACL_USER, ACL_GROUP, ACL_GROUP_OBJ) and p & ~mk & 7
+                                              for t, p, _i in a):
+                        add("nfs4_over_mask", e.path)
+                        break
+                if any((t == ACL_USER and uid_name(i) is None) or (t == ACL_GROUP and gid_name(i) is None)
+                       for a in (acc, dfl) for t, _p, i in a):
+                    add("nfs4_unnamed_principal", e.path)
             if check_flags:
                 fl = get_fsflags_fd(e.fd)
                 if fl and fl & PROTECT_FLAGS:
@@ -980,10 +1572,32 @@ def cmd_audit(params):
             return [{"id": k, "name": namer(k), "count": v}
                     for k, v in sorted(d.items(), key=lambda kv: -kv[1])[:15]]
 
+        props = zfs_props(target.dataset)
+        nfs4 = dict(idmap_info())
+        nfs4.update({
+            "xattr": props.get("xattr", {}).get("value"),
+            "acltype": norm_prop("acltype", props.get("acltype", {}).get("value")),
+            "native": nfsv4_native_support(),
+            "orphans": counts["orphan_uid"] + counts["orphan_gid"],
+        })
+        notes = []
+        if nfs4["xattr"] == "dir":
+            notes.append("xattr=dir : les ACL sont des fichiers cachés, chaque GETATTR NFS les relit ; passez en xattr=sa")
+        if nfs4["acltype"] == "off":
+            notes.append("acltype=off : les clients NFSv4 ne verront que OWNER@ / GROUP@ / EVERYONE@ et "
+                         "nfs4_setfacl avec des entrées nommées échouera")
+        if nfs4["orphans"]:
+            notes.append("UID / GID sans nom : avec sec=sys et nfs4_disable_idmapping=Y le client voit le numéro ; "
+                         "avec sec=krb5* ou idmapping actif, il voit nobody")
+        if counts["ntacl"]:
+            notes.append("ACL NT (security.NTACL) présentes : invisibles et non appliquées côté NFS")
+        if nfs4["disable_idmapping"] is None:
+            notes.append("nfsd n'est pas chargé : nfs4_disable_idmapping inconnu (défaut noyau : Y)")
+        nfs4["notes"] = notes
         return {
             "path": target.path, "dataset": target.dataset, "acl_mode": acltype,
             "total": total, "files": files, "dirs": dirs, "truncated": truncated,
-            "counts": counts, "findings": findings,
+            "counts": counts, "findings": findings, "nfs4": nfs4,
             "owners": top(owners, uid_name), "groups": top(groups, gid_name),
             "modes": [{"mode": k[:-1], "kind": "dossier" if k[-1] == "d" else "fichier", "count": v}
                       for k, v in sorted(modes.items(), key=lambda kv: -kv[1])[:20]],
@@ -1733,8 +2347,16 @@ def cmd_preset(params):
     if params.get("preset") == "macos-smb" and props.get("normalization", {}).get("value") != "formD":
         notes.append("normalization=formD est recommandé pour macOS mais ne se fixe qu'à la création (zfs create -o normalization=formD)")
     if params.get("preset") == "nfsv4":
-        notes.append("OpenZFS sous Linux (upstream) refuse acltype=nfsv4 ; la commande échouera hors FreeBSD / TrueNAS")
-    if params.get("preset") in ("noacl-unix", "posixacl-smb"):
+        native = nfsv4_native_support()
+        notes.append(native["message"])
+        if not native["supported"]:
+            notes.append("Utilisez plutôt « nfsv4-posix » : knfsd présente les ACL POSIX comme des ACL NFSv4")
+            if not params.get("dry_run", True):
+                raise PermError("acltype=nfsv4 non supporté par OpenZFS upstream sous Linux : rien n'a été modifié")
+    if params.get("preset") == "nfsv4-posix":
+        notes.append("Export : n'utilisez pas l'option no_acl ; sec=krb5i/krb5p pour des noms fiables ; "
+                     "NFSv4.1 n'a pas les xattrs utilisateur (NFSv4.2 seulement)")
+    if params.get("preset") in ("noacl-unix", "posixacl-smb", "nfsv4-posix"):
         notes.append("Changer acltype n'efface pas les ACL existantes : utilisez la réinitialisation « Retirer les ACL » si besoin")
     if params.get("dry_run", True):
         return {"dry_run": True, "changes": changes, "commands": [" ".join(c) for c in commands], "notes": notes}
@@ -1759,6 +2381,8 @@ COMMANDS = {
     "delegation": cmd_delegation,
     "delegate": cmd_delegate,
     "preset": cmd_preset,
+    "nfs4-translate": cmd_nfs4_translate,
+    "nfsv4-support": lambda _p: dict(nfsv4_native_support(), idmap=idmap_info()),
     "methods": lambda _p: {"methods": RESET_METHODS, "presets": {k: v["label"] for k, v in PRESETS.items()}},
 }
 

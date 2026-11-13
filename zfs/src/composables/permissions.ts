@@ -36,6 +36,58 @@ export interface PathInfo {
 	has_posix_acl: boolean;
 	immutable: boolean;
 	append_only: boolean;
+	/** ACL telle que vue par un client NFSv4 (rendu nfs4_getfacl, identifiants numériques) */
+	nfs4_text?: string[];
+	nfs4_deny?: number;
+}
+
+export interface IdmapInfo {
+	domain: string;
+	domain_source: string;
+	/** /sys/module/nfsd/parameters/nfs4_disable_idmapping ; null si nfsd n'est pas chargé */
+	disable_idmapping: boolean | null;
+	nfsd_loaded: boolean;
+}
+
+export interface Nfs4Ace {
+	type: number;
+	flag: number;
+	mask: number;
+	who: 'OWNER@' | 'GROUP@' | 'EVERYONE@' | 'named';
+	id: number | null;
+	group: boolean;
+	text: string;
+}
+
+export interface Nfs4View {
+	aces?: Nfs4Ace[];
+	/** rendu nfs4_getfacl avec noms user@domaine */
+	text?: string[];
+	/** rendu avec identifiants numériques (sec=sys et nfs4_disable_idmapping=Y) */
+	numeric_text?: string[];
+	deny_count?: number;
+	notes?: string[];
+	idmap?: IdmapInfo;
+	error?: string;
+}
+
+export interface Nfs4NativeSupport {
+	supported: boolean;
+	hints: string[];
+	datasets: string[];
+	message: string;
+}
+
+export interface Nfs4TranslateResult {
+	representable: boolean;
+	error: string | null;
+	is_dir: boolean;
+	access?: AclEntry[];
+	default?: AclEntry[];
+	mode?: string | null;
+	readback?: string[];
+	notes?: string[];
+	idmap: IdmapInfo;
 }
 
 export interface InspectResult {
@@ -49,6 +101,7 @@ export interface InspectResult {
 	children: PathInfo[];
 	warnings: string[];
 	acl_mode: 'posix' | 'off' | 'nfsv4';
+	nfs4_view: Nfs4View | null;
 }
 
 export interface WalkOptions {
@@ -96,6 +149,13 @@ export interface AuditResult {
 	owners: { id: number; name: string | null; count: number }[];
 	groups: { id: number; name: string | null; count: number }[];
 	modes: { mode: string; kind: string; count: number }[];
+	nfs4?: IdmapInfo & {
+		xattr: string;
+		acltype: string;
+		native: Nfs4NativeSupport;
+		orphans: number;
+		notes: string[];
+	};
 }
 
 export interface DelegationWho {
@@ -150,7 +210,7 @@ export async function permissionsCall<T = any>(command: string, params: object =
 }
 
 export const inspectPath = (path: string) => permissionsCall<InspectResult>('inspect', { path });
-export const auditPath = (path: string, opts: WalkOptions & { max_entries?: number; check_flags?: boolean } = {}) =>
+export const auditPath = (path: string, opts: WalkOptions & { max_entries?: number; check_flags?: boolean; check_nfs4?: boolean } = {}) =>
 	permissionsCall<AuditResult>('audit', { path, ...opts });
 export const setAcl = (params: { path: string; action: 'set' | 'modify' | 'remove' | 'remove-default'; access: AclEntry[]; default: AclEntry[]; dry_run: boolean; files_conditional_x?: boolean; backup?: boolean } & WalkOptions) =>
 	permissionsCall<PlanResult>('set-acl', params);
@@ -164,6 +224,10 @@ export const delegate = (params: { dataset: string; op: 'allow' | 'unallow'; kin
 	permissionsCall<{ dry_run: boolean; command: string }>('delegate', params);
 export const applyPreset = (dataset: string, preset: string, dryRun: boolean) =>
 	permissionsCall<{ dry_run: boolean; changes: { prop: string; from: string; to: string; note?: string }[]; commands: string[]; notes: string[]; errors?: { command: string; error: string }[] }>('preset', { dataset, preset, dry_run: dryRun });
+/** Teste un texte nfs4_setfacl : représentable en POSIX par knfsd ? */
+export const nfs4Translate = (params: { acl: string; path?: string; is_dir?: boolean; client?: 'nfs4_setfacl' | 'autre' }) =>
+	permissionsCall<Nfs4TranslateResult>('nfs4-translate', params);
+export const nfsv4Support = () => permissionsCall<Nfs4NativeSupport & { idmap: IdmapInfo }>('nfsv4-support');
 export const getMethods = () =>
 	permissionsCall<{ methods: Record<ResetMethod, string>; presets: Record<string, string> }>('methods');
 

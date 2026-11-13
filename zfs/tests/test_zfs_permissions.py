@@ -505,5 +505,284 @@ class PermissionsTest(unittest.TestCase):
             return False
 
 
+# --------------------------------------------------------------------------- NFSv4 (traduction knfsd)
+
+def _load_backend():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("zfs_permissions_backend", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ZP = _load_backend()
+U_OBJ, U, G_OBJ, G, MASK, OTHER = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20
+
+
+def view(acl, default=None, is_dir=False, numeric=True):
+    return ZP.nfs4_render(ZP.nfs4_view(acl, default or [], is_dir), is_dir, numeric=numeric)
+
+
+class Nfs4TranslationTest(unittest.TestCase):
+    """Cas dérivés de fs/nfsd/nfs4acl.c (_posix_to_nfsv4_one, nfs4_acl_nfsv4_to_posix)."""
+
+    def test_mode_seul_fichier(self):
+        self.assertEqual(view(ZP.base_from_mode(0o644)),
+                         ["A::OWNER@:rwatTcCy", "A::GROUP@:rtcy", "A::EVERYONE@:rtcy"])
+
+    def test_mode_seul_dossier_delete_child(self):
+        self.assertEqual(view(ZP.base_from_mode(0o755), is_dir=True),
+                         ["A::OWNER@:rwaDxtTcCy", "A::GROUP@:rxtcy", "A::EVERYONE@:rxtcy"])
+
+    def test_deny_owner_et_group(self):
+        # propriétaire r--, groupe rwx : DENY OWNER@ des bits accordés plus loin
+        self.assertEqual(view(ZP.base_from_mode(0o477)),
+                         ["D::OWNER@:wax", "A::OWNER@:rtTcCy", "A::GROUP@:rwaxtcy", "A::EVERYONE@:rwaxtcy"])
+        # autres rwx, groupe --- : DENY GROUP@ après les ALLOW de groupe
+        self.assertEqual(view(ZP.base_from_mode(0o707)),
+                         ["A::OWNER@:rwaxtTcCy", "A::GROUP@:tcy", "D::GROUP@:rwax", "A::EVERYONE@:rwaxtcy"])
+
+    def test_masque_restrictif_et_nommes(self):
+        acl = [(U_OBJ, 7, None), (U, 7, 1001), (G_OBJ, 7, None), (G, 6, 2001), (MASK, 5, None), (OTHER, 0, None)]
+        self.assertEqual(view(acl), [
+            "A::OWNER@:rwaxtTcCy",
+            "A::1001:rxtcy",          # rwx borné par le masque r-x
+            "A::GROUP@:rxtcy",
+            "A:g:2001:rtcy",          # rw- & r-x = r--
+            "A::EVERYONE@:tcy",
+        ])
+        notes = ZP.nfs4_explain(acl, [], False)
+        self.assertTrue(any("masque" in n for n in notes))
+
+    def test_nomme_moins_que_autres_genere_deny(self):
+        acl = [(U_OBJ, 7, None), (U, 0, 1001), (G_OBJ, 5, None), (MASK, 5, None), (OTHER, 4, None)]
+        self.assertEqual(view(acl), [
+            "A::OWNER@:rwaxtTcCy", "D::1001:rx", "A::1001:tcy", "A::GROUP@:rxtcy", "A::EVERYONE@:rtcy"])
+
+    def test_acl_par_defaut_dossier(self):
+        acc = ZP.base_from_mode(0o750)
+        dfl = [(U_OBJ, 7, None), (G_OBJ, 5, None), (G, 7, 0), (MASK, 7, None), (OTHER, 0, None)]
+        self.assertEqual(view(acc, dfl, is_dir=True), [
+            "A::OWNER@:rwaDxtTcCy", "A::GROUP@:rxtcy", "A::EVERYONE@:tcy",
+            "A:fdi:OWNER@:rwaDxtTcCy", "A:fdi:GROUP@:rxtcy", "A:fdig:0:rwaDxtcy", "A:fdi:EVERYONE@:tcy"])
+        # l'ACL par défaut n'existe pas pour un fichier
+        self.assertEqual(len(view(acc, dfl, is_dir=False)), 3)
+
+    def test_nom_avec_domaine(self):
+        acl = [(U_OBJ, 7, None), (U, 7, 0), (G_OBJ, 7, None), (MASK, 7, None), (OTHER, 0, None)]
+        dom = ZP.idmap_info()["domain"]
+        self.assertIn("A::root@%s:rwaxtcy" % dom, view(acl, numeric=False))
+
+    # ---- sens inverse
+    def test_nfs4_vers_posix_simple(self):
+        r = ZP.nfs4_to_posix("A::OWNER@:rwatTcCy A::GROUP@:rtcy A::EVERYONE@:tcy", False)
+        self.assertTrue(r["representable"])
+        self.assertEqual(r["mode"], "0640")
+        self.assertEqual(r["readback"], ["A::OWNER@:rwatTcCy", "A::GROUP@:rtcy", "A::EVERYONE@:tcy"])
+
+    def test_ecriture_pessimiste(self):
+        # w sans a : pas d'écriture POSIX (low_mode_from_nfs4)
+        r = ZP.nfs4_to_posix("A::OWNER@:rw A::GROUP@: A::EVERYONE@:", False)
+        self.assertEqual(r["mode"], "0400")
+        self.assertTrue(any("pessimiste" in n for n in r["notes"]))
+        # sur un dossier, il faut aussi D
+        self.assertEqual(ZP.nfs4_to_posix("A::OWNER@:rwax", True)["mode"], "0500")
+        self.assertEqual(ZP.nfs4_to_posix("A::OWNER@:rwaDx", True)["mode"], "0700")
+
+    def test_deny_avant_allow(self):
+        # DENY puis ALLOW du même bit : refusé (allow_bits ignore les bits déjà refusés)
+        r = ZP.nfs4_to_posix("D::EVERYONE@:w A::EVERYONE@:rwa", False)
+        self.assertEqual(r["mode"], "0444")
+        # DENY d'un groupe nommé : propagé au propriétaire et aux autres entrées
+        r = ZP.nfs4_to_posix("A::OWNER@:rwa D:g:root:w A::EVERYONE@:r", False)
+        self.assertEqual(r["access"][0], {"tag": "user", "qualifier": "", "perms": "rw-"})
+
+    def test_nomme_herite_de_everyone(self):
+        # find_uid() : un nommé vu après EVERYONE@ part des bits déjà accordés à tout le monde
+        r = ZP.nfs4_to_posix("A::OWNER@:rwa A::EVERYONE@:r A::root:wa", False)
+        self.assertIn({"tag": "user", "qualifier": "root", "perms": "rw-"}, r["access"])
+        self.assertIn({"tag": "mask", "qualifier": "", "perms": "rw-"}, r["access"])
+
+    def test_defaut_complete_par_effectif(self):
+        r = ZP.nfs4_to_posix("A::OWNER@:rwaDx A::GROUP@:rx A::EVERYONE@: A:fdi:OWNER@:rwaDx", True)
+        self.assertEqual(r["default"], [{"tag": "user", "qualifier": "", "perms": "rwx"},
+                                        {"tag": "group", "qualifier": "", "perms": "r-x"},
+                                        {"tag": "other", "qualifier": "", "perms": "---"}])
+
+    def test_einval(self):
+        self.assertIn("ATTRNOTSUPP", ZP.nfs4_to_posix("U::EVERYONE@:r", False)["error"])
+        self.assertIn("ATTRNOTSUPP", ZP.nfs4_to_posix("A:S:OWNER@:r", True)["error"])
+        self.assertIn("ATTRNOTSUPP", ZP.nfs4_to_posix("A:n:OWNER@:r", True)["error"])
+        # client autre que nfs4_setfacl : héritage sur un fichier → EINVAL
+        self.assertIn("fichier", ZP.nfs4_to_posix("A:fd:OWNER@:r", False, client_filter=False)["error"])
+        # nfs4_setfacl retire lui-même f/d/i et D sur un fichier
+        r = ZP.nfs4_to_posix("A:fd:OWNER@:rwaD", False)
+        self.assertTrue(r["representable"])
+        self.assertTrue(any("retire" in n for n in r["notes"]))
+
+    def test_principal_inconnu(self):
+        with self.assertRaises(ZP.PermError):
+            ZP.nfs4_to_posix("A::utilisateur-inexistant-xyz@dom:r", False)
+
+    def test_aliases_et_drapeau_p(self):
+        a = ZP.parse_nfs4_text("A::OWNER@:R,A::OWNER@:W,A::OWNER@:X", is_dir=True)
+        self.assertEqual([x["mask"] for x in a], [0x120089, 0x1601d6, 0x1200a0])
+        with self.assertRaises(ZP.PermError):
+            ZP.parse_nfs4_text("A:p:OWNER@:r")
+
+
+SHIM_C = r"""
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <errno.h>
+static ssize_t rd(void *v, size_t size) {
+  const char *p = getenv("NFS4_XDR_IN"); FILE *f; char b[65536]; size_t n;
+  if (!p || !(f = fopen(p, "rb"))) { errno = ENODATA; return -1; }
+  n = fread(b, 1, sizeof b, f); fclose(f);
+  if (!size) return n; if (size < n) { errno = ERANGE; return -1; } memcpy(v, b, n); return n; }
+ssize_t getxattr(const char *p, const char *n, void *v, size_t s) {
+  if (strcmp(n, "system.nfs4_acl")) { errno = ENODATA; return -1; } return rd(v, s); }
+ssize_t lgetxattr(const char *p, const char *n, void *v, size_t s) { return getxattr(p, n, v, s); }
+int setxattr(const char *p, const char *n, const void *v, size_t s, int fl) {
+  const char *o = getenv("NFS4_XDR_OUT"); FILE *f; if (!o) return 0;
+  f = fopen(o, "wb"); fwrite(v, 1, s, f); fclose(f); return 0; }
+int lsetxattr(const char *p, const char *n, const void *v, size_t s, int fl) { return setxattr(p, n, v, s, fl); }
+"""
+
+
+@unittest.skipUnless(shutil.which("nfs4_getfacl") and shutil.which("gcc"), "nfs4-acl-tools + gcc requis")
+class Nfs4ToolsReferenceTest(unittest.TestCase):
+    """Compare le rendu et l'analyse avec les vrais nfs4_getfacl / nfs4_setfacl, via un
+    LD_PRELOAD qui remplace l'xattr system.nfs4_acl par un fichier XDR."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="nfs4ref-")
+        src = os.path.join(cls.tmp, "shim.c")
+        with open(src, "w") as f:
+            f.write(SHIM_C)
+        cls.shim = os.path.join(cls.tmp, "shim.so")
+        subprocess.run(["gcc", "-shared", "-fPIC", "-o", cls.shim, src], check=True)
+        os.makedirs(os.path.join(cls.tmp, "d"))
+        open(os.path.join(cls.tmp, "f"), "w").close()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def xdr(aces):
+        import struct
+        out = struct.pack(">I", len(aces))
+        for a in aces:
+            who = (ZP.nfs4_principal(a, numeric=True)).encode()
+            out += struct.pack(">III", a["type"], a["flag"], a["mask"]) + struct.pack(">I", len(who)) \
+                + who + b"\0" * ((4 - len(who) % 4) % 4)
+        return out
+
+    @staticmethod
+    def unxdr(data):
+        import struct
+        n = struct.unpack(">I", data[:4])[0]
+        o, out = 4, []
+        for _ in range(n):
+            t, fl, m = struct.unpack(">III", data[o:o + 12])
+            o += 12
+            ln = struct.unpack(">I", data[o:o + 4])[0]
+            o += 4
+            out.append((t, fl, m, data[o:o + ln].decode()))
+            o += ln + (4 - ln % 4) % 4
+        return out
+
+    def env(self, **kw):
+        return dict(os.environ, LD_PRELOAD=self.shim, **kw)
+
+    def test_rendu_identique_a_nfs4_getfacl(self):
+        cases = [
+            (ZP.base_from_mode(0o644), [], False),
+            (ZP.base_from_mode(0o477), [], False),
+            (ZP.base_from_mode(0o2775), [(U_OBJ, 7, None), (G_OBJ, 7, None), (G, 5, 0), (MASK, 7, None), (OTHER, 5, None)], True),
+            ([(U_OBJ, 7, None), (U, 1, 1001), (G_OBJ, 6, None), (G, 7, 2001), (MASK, 6, None), (OTHER, 4, None)], [], True),
+        ]
+        for acc, dfl, is_dir in cases:
+            aces = ZP.nfs4_view(acc, dfl, is_dir)
+            path = os.path.join(self.tmp, "in.xdr")
+            with open(path, "wb") as f:
+                f.write(self.xdr(aces))
+            out = subprocess.run(["nfs4_getfacl", os.path.join(self.tmp, "d" if is_dir else "f")],
+                                 env=self.env(NFS4_XDR_IN=path), capture_output=True, text=True).stdout
+            lines = [l for l in out.splitlines() if l and not l.startswith("#")]
+            self.assertEqual(lines, ZP.nfs4_render(aces, is_dir, numeric=True))
+
+    def test_analyse_identique_a_nfs4_setfacl(self):
+        empty = os.path.join(self.tmp, "empty.xdr")
+        with open(empty, "wb") as f:
+            f.write(b"\0\0\0\0")
+        for target, is_dir in (("d", True), ("f", False)):
+            for text in ("A::OWNER@:rwaDdxtTnNcCoy", "A:fdig:1000:R", "D::EVERYONE@:W", "A:n:OWNER@:X",
+                         "A:fdi:OWNER@:rwaD", "A:S:GROUP@:r"):
+                out = os.path.join(self.tmp, "out.xdr")
+                if os.path.exists(out):
+                    os.unlink(out)
+                subprocess.run(["nfs4_setfacl", "-s", text, os.path.join(self.tmp, target)],
+                               env=self.env(NFS4_XDR_IN=empty, NFS4_XDR_OUT=out), capture_output=True)
+                with open(out, "rb") as f:
+                    ref = self.unxdr(f.read())
+                mine = [(a["type"], a["flag"], a["mask"], a["principal"])
+                        for a in ZP.parse_nfs4_text(text, is_dir=is_dir)]
+                self.assertEqual(mine, ref, (target, text))
+
+
+class _Nfs4CommandTests:
+    """Tests de commandes NFSv4, greffés sur PermissionsTest (même banc d'essai,
+    sans réexécuter les tests hérités)."""
+
+    def test_inspect_vue_nfs4(self):
+        subprocess.run(["setfacl", "-m", "u:nobody:rwx,m::r-x", self.p("a/f1")], check=True)
+        d = self.ok("inspect", path=self.p("a/f1"))
+        v = d["nfs4_view"]
+        self.assertIn("A::65534:rxtcy", v["numeric_text"])
+        self.assertTrue(any("masque" in n for n in v["notes"]))
+        parent = self.ok("inspect", path=self.p("a"))
+        child = [c for c in parent["children"] if c["path"].endswith("/f1")][0]
+        # propriétaire rw-, nommé r-x effectif : knfsd commence par DENY OWNER@ x
+        self.assertEqual(child["nfs4_text"][:2], ["D::OWNER@:x", "A::OWNER@:rwatTcCy"])
+
+    def test_audit_nfs4(self):
+        os.chmod(self.p("a/f1"), 0o477)
+        subprocess.run(["setfacl", "-m", "u:12345:rwx,m::r--", self.p("a/x.sh")], check=True)
+        d = self.ok("audit", path=self.root)
+        self.assertGreaterEqual(d["counts"]["nfs4_deny"], 1)
+        self.assertIn(self.p("a/f1"), d["findings"]["nfs4_deny"])
+        self.assertIn(self.p("a/x.sh"), d["findings"]["nfs4_over_mask"])
+        self.assertIn(self.p("a/x.sh"), d["findings"]["nfs4_unnamed_principal"])
+        self.assertIn("domain", d["nfs4"])
+        self.assertFalse(d["nfs4"]["native"]["supported"])
+
+    def test_translate(self):
+        d = self.ok("nfs4-translate", acl="A::OWNER@:rwatTcCy,A::GROUP@:rtcy,A::EVERYONE@:", path=self.p("a/f1"))
+        self.assertTrue(d["representable"])
+        self.assertFalse(d["is_dir"])
+        self.assertEqual(d["mode"], "0640")
+        d = self.ok("nfs4-translate", acl="L::EVERYONE@:r", is_dir=True)
+        self.assertFalse(d["representable"])
+
+    def test_preset_nfsv4(self):
+        d = self.ok("preset", dataset="tank/data", preset="nfsv4-posix", dry_run=True)
+        self.assertEqual(d["commands"], ["zfs set dnodesize=auto tank/data"])
+        d = self.ok("preset", dataset="tank/data", preset="nfsv4", dry_run=True)
+        self.assertTrue(any("non supporté" in n for n in d["notes"]))
+        d = self.call("preset", dataset="tank/data", preset="nfsv4", dry_run=False)
+        self.assertFalse(d["ok"])
+
+
+for _name, _fn in list(vars(_Nfs4CommandTests).items()):
+    if _name.startswith("test_"):
+        setattr(PermissionsTest, _name, _fn)
+
+
 if __name__ == "__main__":
     unittest.main()

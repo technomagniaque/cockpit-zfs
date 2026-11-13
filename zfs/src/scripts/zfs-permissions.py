@@ -42,11 +42,13 @@ import errno
 import fcntl
 import fnmatch
 import grp
+import ipaddress
 import gzip
 import json
 import os
 import pwd
 import re
+import shlex
 import stat
 import struct
 import subprocess
@@ -576,28 +578,28 @@ _idmap_cache = {}
 
 
 def _dns_domain():
-    """Domaine DNS sans résolution inverse : partie du nom d'hôte après le premier point,
-    sinon nom canonique via getaddrinfo (délai court), sinon « localdomain »."""
+    """Comme domain_from_dns() de libnfsidmap : nom canonique de gethostbyname(gethostname()), partie après le
+    premier point (délai court). libnfsidmap récent interroge aussi l'enregistrement DNS TXT _nfsv4idmapdomain :
+    non consulté ici (pas de requête DNS supplémentaire)."""
     import socket
     import threading
     host = socket.gethostname()
-    if "." in host:
-        return host.split(".", 1)[1], "domaine DNS (nom d'hôte)"
     box = {}
 
     def lookup():
         try:
-            box["r"] = socket.getaddrinfo(host, None, 0, 0, 0, socket.AI_CANONNAME)
+            box["name"] = socket.gethostbyname_ex(host)[0]
         except OSError:
             pass
     t = threading.Thread(target=lookup, daemon=True)
     t.start()
     t.join(1.5)
-    for r in box.get("r") or []:
-        canon = r[3]
-        if canon and "." in canon:
-            return canon.split(".", 1)[1], "domaine DNS (nom canonique)"
-    return "localdomain", "défaut (aucun domaine trouvé)"
+    canon = box.get("name") or ""
+    if "." in canon:
+        return canon.split(".", 1)[1], "domaine DNS (nom canonique de l'hôte)"
+    if "." in host:
+        return host.split(".", 1)[1], "domaine DNS (nom d'hôte)"
+    return "localdomain", "défaut (aucun domaine trouvé ; vérifiez aussi un éventuel TXT _nfsv4idmapdomain)"
 
 
 def idmap_info():
@@ -613,12 +615,15 @@ def idmap_info():
                 line = line.strip()
                 if not line or line[0] in "#;":
                     continue
-                line = re.split(r"\s[#;]", line, 1)[0].strip()
+                # conffile.c (nfs-utils) : la valeur s'arrête au premier « # » ou « ; », même sans espace
+                line = re.split(r"[#;]", line, 1)[0].strip()
                 if line.startswith("["):
                     section = line.strip("[]").strip().lower()
                 elif "=" in line:
                     k, v = (x.strip() for x in line.split("=", 1))
                     k = k.lower()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1].strip()
                     if section == "general" and k == "domain" and v:
                         domain, source = v, "idmapd.conf"
                     elif section == "mapping" and k == "nobody-user" and v:
@@ -649,8 +654,9 @@ def nfs4_principal(a, numeric=False):
     name = gid_name(a["id"]) if a["group"] else uid_name(a["id"])
     info = idmap_info()
     if name is None:
-        # nfsd4_encode_name → idmap : un identifiant sans nom part comme Nobody-User / Nobody-Group
-        name = info["nobody_group"] if a["group"] else info["nobody_user"]
+        # rpc.idmapd (idtonameres / nfsdcb IC_IDNAME) : identifiant sans nom → Nobody-User / Nobody-Group BRUT,
+        # sans @domaine
+        return info["nobody_group"] if a["group"] else info["nobody_user"]
     return "%s@%s" % (name, info["domain"])
 
 
@@ -757,8 +763,8 @@ def nfs3_view(access, default, is_dir, posix_fs, st_mode):
     wd = nfsacl_wire(default) if is_dir else []
     over = [label for label, a in (("accès", access), ("défaut", default)) if len(a) > NFS_ACL_MAX_ENTRIES]
     if over:
-        notes.append("ACL %s de plus de %d entrées : nfsacl_encode() renvoie EINVAL, GETACL échoue pour ce fichier"
-                     % (" et ".join(over), NFS_ACL_MAX_ENTRIES))
+        notes.append("ACL %s de plus de %d entrées : l'encodage NFSACL échoue et le serveur répond par une erreur "
+                     "système RPC : GETACL échoue pour ce fichier" % (" et ".join(over), NFS_ACL_MAX_ENTRIES))
     if len(access) == 3:
         notes.append("ACL minimale : le serveur ajoute mask:: = droits du groupe ; le client Linux la ramène "
                      "en général au simple mode")
@@ -1598,8 +1604,10 @@ def cmd_inspect(params):
         for p in ("aclinherit", "aclmode"):
             if props.get(p, {}).get("source") == "local":
                 warnings.append("%s n'a aucun effet avec des ACL POSIX sous Linux (s'applique aux ACL NFSv4)" % p)
-    if acltype == "off" and info["has_posix_acl"]:
-        warnings.append("Des ACL POSIX sont stockées mais ignorées (acltype=off)")
+    if acltype == "nfsv4":
+        warnings.append("acltype=nfsv4 : sous OpenZFS upstream Linux, se comporte comme acltype=off (ACL désactivées)")
+    if acltype in ("off", "nfsv4") and info["has_posix_acl"]:
+        warnings.append("Des ACL POSIX sont stockées mais ignorées (acltype=%s)" % acltype)
     if info["has_ntacl"]:
         warnings.append("ACL NT présente (security.NTACL) : Samba / ksmbd avec acl_xattr l'affiche au client Windows")
     if os.path.realpath(params.get("path") or path) != os.path.normpath(params.get("path") or path):
@@ -1696,7 +1704,8 @@ def cmd_audit(params):
             if NTACL_XATTR in x:
                 add("ntacl", e.path)
             if ACCESS_XATTR in x or DEFAULT_XATTR in x:
-                add("ignored_posix_acl" if acltype == "off" else "posix_acl", e.path)
+                # acltype=nfsv4 = off sous Linux upstream : ACL stockées mais ignorées dans les deux cas
+                add("posix_acl" if acltype == "posix" else "ignored_posix_acl", e.path)
             if check_nfs4:
                 try:
                     acc = read_access(e.fd, st) if acltype == "posix" else base_from_mode(st.st_mode)
@@ -2527,8 +2536,10 @@ def cmd_preset(params):
 
 # Clés acceptées par OpenZFS dans sharenfs sous Linux (lib/libzfs/os/linux/libzfs_share_nfs.c,
 # get_linux_shareopts_cb) + rw / ro (listes d'hôtes séparées par « : »), sec, anon, root_mapping, nosub
+# fsuid figure dans la liste d'OpenZFS mais nfs-utils ne le connaît pas : retiré (exportfs ignorerait la ligne
+# et toutes les suivantes de zfs.exports).
 SHARENFS_KEYS = {
-    "all_squash", "anongid", "anonuid", "async", "auth_nlm", "crossmnt", "fsid", "fsuid", "hide",
+    "all_squash", "anongid", "anonuid", "async", "auth_nlm", "crossmnt", "fsid", "hide",
     "insecure", "insecure_locks", "mountpoint", "mp", "no_acl", "no_all_squash", "no_auth_nlm",
     "no_root_squash", "no_subtree_check", "no_wdelay", "nohide", "refer", "replicas", "root_squash",
     "secure", "secure_locks", "subtree_check", "sync", "wdelay",
@@ -2536,7 +2547,14 @@ SHARENFS_KEYS = {
 }
 SHARENFS_CHARS = re.compile(r"[A-Za-z0-9_=,.:@/*\-\[\]]{1,1024}")
 EXPORT_OPT_CHARS = re.compile(r"[A-Za-z0-9_=,.:@/\-]{1,1024}")
-CLIENT_CHARS = re.compile(r"[A-Za-z0-9_.*?:@/\-\[\]]{1,255}")
+CLIENT_CHARS = re.compile(r"[A-Za-z0-9_.*?:@/\[\]][A-Za-z0-9_.*?:@/\-\[\]]{0,254}")   # jamais de « - » initial
+# options sharenfs qui prennent une valeur ; toutes les autres sont booléennes (« = » interdit)
+SHARENFS_VALUE_KEYS = {"anongid", "anonuid", "fsid", "mountpoint", "mp", "refer", "replicas", "rw", "ro", "sec",
+                       "anon", "root_mapping"}
+SHARENFS_OPTIONAL_VALUE = {"rw", "ro", "mountpoint", "mp"}
+SEC_FLAVORS = {"sys", "krb5", "krb5i", "krb5p"}
+INVALID_OPT_MSG = (" — une option invalide fait ignorer par exportfs cette ligne ET toutes les lignes suivantes de "
+                   "/etc/exports.d/zfs.exports (les autres datasets ne seraient plus exportés)")
 DATASET_CHARS = re.compile(r"[A-Za-z0-9_.:\-]+(/[A-Za-z0-9_.:\- ]+)*")
 
 
@@ -2556,23 +2574,30 @@ def _unescape_export_path(p):
 
 
 def escape_export_path(p):
-    """Comme nfs_escape_mountpoint() d'OpenZFS : espaces, tabulations, retours et « \\ » en octal."""
-    return "".join("\\%03o" % ord(c) if c in "\t\n\v\f\r \\" else c for c in p)
+    """Comme nfs_escape_mountpoint() d'OpenZFS (espaces, tabulations, retours, « \\ » en octal), plus « " » :
+    xgettok() de nfs-utils bascule en mode guillemets sur « " » et le retire du chemin."""
+    return "".join("\\%03o" % ord(c) if c in "\t\n\v\f\r \\\"" else c for c in p)
 
 
 def _split_tokens(line):
-    toks, cur, quote = [], "", False
+    """Découpe comme xgettok() de nfs-utils : « " » bascule le mode guillemets (et disparaît),
+    « # » ne commence un commentaire qu'en début de jeton, hors guillemets."""
+    toks, cur, quote, started = [], "", False, False
     for ch in line:
         if ch == '"':
             quote = not quote
+            started = True
             continue
+        if not quote and ch == "#" and not started:
+            break
         if ch.isspace() and not quote:
-            if cur:
+            if started:
                 toks.append(cur)
-                cur = ""
+                cur, started = "", False
             continue
         cur += ch
-    if cur:
+        started = True
+    if started:
         toks.append(cur)
     return toks
 
@@ -2588,11 +2613,11 @@ def parse_exports_text(text, fname):
             logical += line[:-1] + " "
             continue
         logical += line
-        body = logical.split("#", 1)[0].strip()
+        body = logical.strip()
         logical = ""
-        if not body:
+        toks = _split_tokens(body) if body else []
+        if not toks:
             continue
-        toks = _split_tokens(body)
         path = _unescape_export_path(toks[0])
         defaults, clients, notes = [], [], []
         for t in toks[1:]:
@@ -2611,7 +2636,9 @@ def parse_exports_text(text, fname):
         if not clients:
             clients.append({"host": "*", "options": defaults})
             notes.append("aucun client indiqué : exporté à tous (*)")
-        entries.append({"path": os.path.normpath(path), "file": fname, "line": start, "clients": clients,
+        npath = os.path.normpath(path)
+        entries.append({"path": npath, "realpath": os.path.realpath(npath), "file": fname, "line": start,
+                        "clients": clients,
                         "source": "sharenfs" if os.path.basename(fname) == "zfs.exports" else "manuel",
                         "notes": notes})
     return entries
@@ -2667,15 +2694,84 @@ def _list_datasets(dataset):
     return rows
 
 
-def _sharenfs_world_rw(value):
+def _oz_split_hosts(value):
+    """Découpage exact de foreach_nfs_host_cb() (OpenZFS, libzfs_share_nfs.c, Linux) d'une liste rw= / ro=.
+    Renvoie les hôtes tels qu'écrits dans zfs.exports (après retrait du « @ » par get_linux_hostspec)."""
+    out = []
+    host = value
+    while True:
+        if host.startswith("["):
+            h = host[1:]
+            j = h.find("]")
+            if j < 0:
+                raise PermError("« [ » sans « ] » dans %r : OpenZFS refuse (SA_SYNTAX_ERR)" % value)
+            after = h[j + 1:]
+            if after == "":
+                cur, nxt = h[:j], None
+            elif after.startswith("/"):
+                c = after.find(":", 1)
+                cur, nxt = (h[:j] + after, None) if c < 0 else (h[:j] + after[:c], after[c + 1:])
+            elif after.startswith(":"):
+                cur, nxt = h[:j], after[1:]
+            else:
+                raise PermError("Caractère inattendu après « ] » dans %r : OpenZFS refuse (SA_SYNTAX_ERR)" % value)
+            bracketed = True
+        else:
+            c = host.find(":")
+            cur, nxt = (host, None) if c < 0 else (host[:c], host[c + 1:])
+            bracketed = False
+        out.append({"raw": cur, "host": cur[1:] if cur.startswith("@") else cur, "bracketed": bracketed})
+        if nxt is None:
+            return out
+        host = nxt
+
+
+def sharenfs_lines(value, mountpoint="<mountpoint>"):
+    """Simule les lignes que nfs_add_entry() écrit dans zfs.exports. Lève PermError si OpenZFS refuserait."""
     if value == "on":
-        return True
-    opts = value.split(",")
+        value = "rw,crossmnt"
+    if value in ("off", "", "-"):
+        return []
+    opts = [o for o in value.split(",") if o]
+    linux = ["no_subtree_check", "mountpoint"]
     for o in opts:
         k, eq, v = o.partition("=")
-        if k == "rw" and (not eq or not v):
-            return True
-    return not any(o.partition("=")[0] in ("rw", "ro") for o in opts)
+        if k in ("sec", "ro", "rw"):
+            continue
+        if k == "anon":
+            k = "anonuid"
+        if k == "root_mapping":
+            linux.append("root_squash")
+            k = "anonuid"
+        if k == "nosub":
+            k = "subtree_check"
+        linux.append(k + ("=" + v if eq else ""))
+    sec, lines = "sys", []
+    for o in opts:
+        k, eq, v = o.partition("=")
+        if k == "sec":
+            sec = v
+        elif k in ("rw", "ro"):
+            for h in _oz_split_hosts(v if eq else "*"):
+                lines.append({"access": k, "host": h["host"], "raw": h["raw"], "bracketed": h["bracketed"],
+                              "sec": sec,
+                              "line": "%s %s(sec=%s,%s,%s)" % (escape_export_path(mountpoint), h["host"], sec, k,
+                                                               ",".join(linux))})
+    return lines
+
+
+def _sharenfs_world(value):
+    """Accès (« rw », « ro ») ouverts à TOUS les clients : hôte « * » ou hôte vide (nfs-utils : « No host name
+    given », pris comme « * »). Tolérant : une valeur illisible renvoie un ensemble vide."""
+    try:
+        lines = sharenfs_lines(value)
+    except PermError:
+        return set()
+    return {l["access"] for l in lines if l["host"] in ("*", "")}
+
+
+def _sharenfs_world_rw(value):
+    return bool(_sharenfs_world(value))
 
 
 def _acl_counts(path):
@@ -2693,7 +2789,7 @@ def cmd_nfs_datasets(params):
     exports = read_exports()
     by_path = {}
     for e in exports:
-        by_path.setdefault(e["path"], []).append(e)
+        by_path.setdefault(e.get("realpath", e["path"]), []).append(e)
     fsid_users = {}
     for e in exports:
         for c in e["clients"]:
@@ -2704,7 +2800,7 @@ def cmd_nfs_datasets(params):
     max_entries = int(params.get("max_entries", 200000))
     exported = {}
     for r in rows:
-        mnt = r["path"]
+        mnt = os.path.realpath(r["path"]) if r["path"] else None
         manual = [e for e in by_path.get(mnt, []) if e["source"] == "manuel"] if mnt else []
         zfs_lines = [e for e in by_path.get(mnt, []) if e["source"] == "sharenfs"] if mnt else []
         r["exports"] = manual + zfs_lines
@@ -2720,11 +2816,16 @@ def cmd_nfs_datasets(params):
         opts = [o for e in r["exports"] for c in e["clients"] for o in c["options"]]
         if r["sharenfs_on"]:
             opts += [o for o in r["sharenfs"].split(",") if o]
+        # parent = l'export le plus proche par CHEMIN de montage (mountpoint personnalisé, legacy, none)
         parent = None
-        for other in reversed(names[:names.index(r["name"])]):
-            if r["name"].startswith(other + "/") and exported[other]["exported"]:
-                parent = exported[other]
-                break
+        if r["path"]:
+            best = -1
+            for other in rows:
+                op = other["path"]
+                if other is r or not op or not other["exported"] or not other["mounted"]:
+                    continue
+                if r["path"].startswith(op.rstrip("/") + "/") and len(op) > best:
+                    parent, best = other, len(op)
         if not r["mounted"] or not r["path"]:
             add("info", "not_mounted", "Non monté (ou mountpoint=%s) : rien n'est exporté ; sharenfs n'exporte que "
                 "les datasets montés (option mountpoint ajoutée par OpenZFS)" % r["mountpoint"])
@@ -2734,8 +2835,9 @@ def cmd_nfs_datasets(params):
             if "crossmnt" in p_opts or parent["sharenfs"] == "on":
                 add("warning", "implicit_child",
                     "Pas d'export explicite : atteint seulement par traversée grâce à crossmnt sur %s (export implicite "
-                    "aux options du parent, géré par mountd), sans fsid propre et non montable directement par un "
-                    "client NFSv3 : ajoutez un export explicite" % parent["name"])
+                    "aux options du parent, géré par mountd), sans fsid propre. Selon la version de nfs-utils, mountd "
+                    "peut autoriser le montage direct d'un sous-montage avec crossmnt ; exportez-le explicitement "
+                    "pour être sûr (NFSv3 surtout)" % parent["name"])
             else:
                 add("error", "hidden_child",
                     "Non exporté alors que %s l'est : en NFSv3 comme en NFSv4.1, le client voit le dossier VIDE du "
@@ -2752,18 +2854,27 @@ def cmd_nfs_datasets(params):
         manual = [e for e in r["exports"] if e["source"] == "manuel"]
         if manual and r["sharenfs_on"]:
             add("error", "duplicate",
-                "Exporté à la fois par sharenfs (%s) et par %s : deux définitions pour le même chemin, la dernière "
-                "lue par exportfs l'emporte ; gardez-en une seule (et ne laissez pas cockpit-file-sharing gérer ce "
-                "chemin si sharenfs est utilisé)" % (r["sharenfs"], ", ".join(sorted({e["file"] for e in manual}))))
+                "Exporté à la fois par sharenfs (%s) et par %s : pour un même client, c'est la PREMIÈRE entrée lue "
+                "qui gagne (/etc/exports avant /etc/exports.d, fichiers dans l'ordre versionsort ; les suivantes sont "
+                "marquées « [IGNORED] ») ; pour des clients différents, toutes s'appliquent. Gardez une seule "
+                "définition (et ne laissez pas cockpit-file-sharing gérer ce chemin si sharenfs est utilisé)"
+                % (r["sharenfs"], ", ".join(sorted({e["file"] for e in manual}))))
         if r["sharenfs_on"] and r["sharenfs_source"].startswith("inherited"):
             add("info", "sharenfs_inherited", "sharenfs hérité (%s) : ce dataset est exporté automatiquement avec les "
                 "options du parent" % r["sharenfs_source"])
             if _opt_value(r["sharenfs"].split(","), "fsid"):
                 add("error", "fsid_inherited", "fsid défini dans un sharenfs hérité : même fsid que le parent, les "
                     "clients confondront les deux systèmes de fichiers ; mettez fsid en local ou retirez-le")
-        if r["sharenfs_on"] and _sharenfs_world_rw(r["sharenfs"]):
-            add("warning", "world", "sharenfs=%s exporte vers TOUS les clients (*)%s" % (
-                r["sharenfs"], " en lecture-écriture" if r["sharenfs"] == "on" or "rw" in r["sharenfs"] else ""))
+        if r["sharenfs_on"]:
+            try:
+                validate_sharenfs(r["sharenfs"])
+            except PermError as e:
+                add("error", "sharenfs_invalid", "sharenfs=%s : %s" % (r["sharenfs"], e))
+            world = _sharenfs_world(r["sharenfs"])
+            if world:
+                add("warning", "world", "sharenfs=%s exporte vers TOUS les clients (*) en %s" % (
+                    r["sharenfs"], " et ".join("lecture-écriture" if a == "rw" else "lecture seule"
+                                               for a in sorted(world, reverse=True))))
         for e in manual:
             for n in e["notes"]:
                 add("warning", "export_note", "%s:%d : %s" % (e["file"], e["line"], n))
@@ -2811,8 +2922,10 @@ def cmd_nfs_datasets(params):
                 except (OSError, PermError) as e:
                     add("warning", "scan_error", "Analyse des ACL impossible : %s" % e)
         for o in over:
-            add("error", "acl_too_long", "%s : ACL de plus de %d entrées, GETACL NFSv3 échoue (nfsacl_encode → "
-                "EINVAL) et l'attribut ACL NFSv4 est refusé" % (o, NFS_ACL_MAX_ENTRIES))
+            add("error", "acl_too_long", "%s : ACL de plus de %d entrées : GETACL NFSv3 échoue (l'encodage NFSACL "
+                "échoue, le serveur répond par une erreur système RPC). En NFSv4.1, knfsd n'a pas ce plafond ; la "
+                "limite est la taille encodée de l'attribut ACL côté client (environ 64 Kio)"
+                % (o, NFS_ACL_MAX_ENTRIES))
         r["findings"] = f
         blocking = {"hidden_child", "duplicate", "fsid_duplicate", "fsid_inherited", "no_posix_acl", "acl_too_long",
                     "not_mounted", "implicit_child"}
@@ -2837,12 +2950,34 @@ def _validate_clients(clients):
         c = str(c).strip()
         if not c:
             continue
-        if not CLIENT_CHARS.fullmatch(c):
-            raise PermError("Client invalide : %r" % c)
+        if c.startswith("-") or not CLIENT_CHARS.fullmatch(c):
+            raise PermError("Client invalide : %r (un client commençant par « - » serait lu comme options par "
+                            "défaut et ferait ignorer le reste du fichier)" % c)
         out.append(c)
     if not out:
         raise PermError("Indiquez au moins un client (adresse, réseau CIDR, nom ou *)")
     return out
+
+
+def _sharenfs_host(c):
+    """Client du format exports → hôte sharenfs (syntaxe OpenZFS)."""
+    if c.startswith("@"):
+        raise PermError("%s : un @netgroup n'est pas représentable dans sharenfs sous Linux (OpenZFS retire le « @ » "
+                        "et en ferait un nom d'hôte) ; utilisez le format /etc/exports" % c)
+    try:
+        net = ipaddress.ip_network(c, strict=False)
+    except ValueError:
+        net = None
+    if net is not None:
+        is_net = "/" in c
+        if net.version == 6:
+            if is_net:
+                return "[%s]/%d" % (net.network_address, net.prefixlen)
+            return "[%s]" % ipaddress.ip_address(c)
+        return ("@%s" % c) if is_net else c
+    if c.startswith("[") or ":" in c:
+        raise PermError("Client %r illisible pour sharenfs" % c)
+    return c
 
 
 def cmd_nfs_generate(params):
@@ -2859,6 +2994,9 @@ def cmd_nfs_generate(params):
         raise PermError("Ne mettez pas fsid dans les options communes : il doit être unique par dataset")
     fsid_mode = params.get("fsid", "guid" if fmt == "exports" else "none")
     include_all = bool(params.get("include_exported"))
+    if fmt == "sharenfs" and "*" in clients and len(clients) > 1:
+        raise PermError("« * » couvre déjà tous les clients : retirez les autres clients ou retirez « * » "
+                        "(sharenfs ne peut pas combiner les deux)")
     lines, commands, skipped, notes = [], [], [], []
     for r in rows:
         if not r["path"] or not r["mounted"]:
@@ -2869,23 +3007,33 @@ def cmd_nfs_generate(params):
         per = list(opt_list)
         if fsid_mode == "guid":
             per.append("fsid=" + fsid_from_guid(r["guid"]))
+            if r["exported"]:
+                notes.append("%s est déjà exporté : lui donner ou changer son fsid change les filehandles, les "
+                             "clients montés recevront ESTALE (démontez puis remontez-les)" % r["name"])
         if fmt == "exports":
             line = escape_export_path(r["path"]) + " " + " ".join("%s(%s)" % (c, ",".join(per)) for c in clients)
             lines.append({"name": r["name"], "line": line})
         elif fmt == "sharenfs":
-            access = "ro" if "ro" in per else "rw"
-            hosts = ":".join(("@" + c) if re.match(r"^[0-9a-fA-F:.]+/\d+$", c) else c for c in clients if c != "*")
-            rest = [o for o in per if o not in ("rw", "ro") and o.partition("=")[0] in SHARENFS_KEYS]
+            # exports(5) : lecture seule par défaut quand ni rw ni ro n'est donné
+            access = "rw" if "rw" in per else "ro"
+            hosts = ":".join(_sharenfs_host(c) for c in clients if c != "*")
+            secs = [o for o in per if o.partition("=")[0] == "sec"]
+            rest = [o for o in per if o not in ("rw", "ro") and o.partition("=")[0] != "sec"
+                    and o.partition("=")[0] in SHARENFS_KEYS]
             dropped = [o for o in per if o not in ("rw", "ro") and o.partition("=")[0] not in SHARENFS_KEYS]
             if dropped:
                 notes.append("Options sans équivalent sharenfs ignorées : %s" % ", ".join(sorted(set(dropped))))
-            value = ",".join(["%s=%s" % (access, hosts) if hosts else access] + rest)
-            if not SHARENFS_CHARS.fullmatch(value):
-                raise PermError("Valeur sharenfs générée invalide : %r" % value)
+            # sec= AVANT rw= / ro= : OpenZFS ne l'applique qu'aux hôtes qui le suivent
+            value = ",".join(rest + secs + ["%s=%s" % (access, hosts) if hosts else access])
+            value = validate_sharenfs(value)
             commands.append({"name": r["name"], "value": value,
-                             "command": "zfs set sharenfs=%s %s" % (value, r["name"])})
+                             "command": "zfs set %s %s" % (shlex.quote("sharenfs=" + value),
+                                                           shlex.quote(r["name"]))})
         else:
             raise PermError("Format inconnu : %s" % fmt)
+    if fsid_mode == "guid":
+        notes.append("fsid tiré du GUID du dataset : stable après zfs rename, mais une réplique (zfs send | recv) a "
+                     "un autre GUID : copiez la ligne d'export d'origine sur la réplique, ne la régénérez pas")
     if fmt == "exports":
         notes.append("À copier dans /etc/exports ou /etc/exports.d/<nom>.exports, puis : exportfs -ra")
         notes.append("Un export par dataset : NFSv3 peut monter chaque dataset, NFSv4.1 les traverse depuis le parent")
@@ -2898,20 +3046,128 @@ def cmd_nfs_generate(params):
             "\n".join(c["command"] for c in commands)}
 
 
-def validate_sharenfs(value):
+def _check_host(raw, bracketed, value):
+    if raw == "":
+        raise PermError("Hôte vide dans %r (« : » en trop ou adresse IPv6 sans crochets) : nfs-utils l'exporterait à "
+                        "TOUS les clients (« No host name given » → *). Écrivez l'IPv6 entre crochets : "
+                        "[fd00::5] ou [fd00::]/64" % value)
+    if raw.startswith("-"):
+        raise PermError("Hôte commençant par « - » refusé : %r" % raw)
+    if bracketed:
+        try:
+            if "/" in raw:
+                ipaddress.IPv6Network(raw, strict=False)
+            else:
+                ipaddress.IPv6Address(raw)
+        except ValueError:
+            raise PermError("Adresse IPv6 invalide entre crochets : %r" % raw)
+        return
+    if raw.startswith("/"):
+        raise PermError("Élément %r dans %r : préfixe sans adresse (IPv6 sans crochets ?)" % (raw, value))
+    if raw.startswith("@"):
+        try:
+            ipaddress.IPv4Network(raw[1:], strict=False)
+        except ValueError:
+            raise PermError("%r : sous Linux, OpenZFS retire seulement le « @ » ; un groupe réseau (netgroup) "
+                            "n'est pas représentable dans sharenfs. Utilisez @a.b.c.d/n pour un réseau IPv4, "
+                            "ou /etc/exports pour un @netgroup" % raw)
+
+
+def _check_option_value(k, eq, v):
+    if k not in SHARENFS_VALUE_KEYS:
+        if eq:
+            raise PermError("%s est une option booléenne : « %s=%s » refusé%s" % (k, k, v, INVALID_OPT_MSG))
+        return
+    if not eq:
+        if k in SHARENFS_OPTIONAL_VALUE:
+            return
+        raise PermError("%s exige une valeur (%s=…)%s" % (k, k, INVALID_OPT_MSG))
+    if k in ("anonuid", "anongid", "anon", "root_mapping"):
+        if not re.fullmatch(r"[0-9]{1,10}", v) or int(v) > 4294967295:
+            raise PermError("%s=%s : entier 0–4294967295 attendu%s" % (k, v, INVALID_OPT_MSG))
+    elif k == "fsid":
+        if not (re.fullmatch(r"[0-9]{1,10}", v) and int(v) <= 4294967295) and v != "root" and \
+                not re.fullmatch(r"[0-9a-fA-F]{32}", v.replace("-", "")):
+            raise PermError("fsid=%s : entier, « root » ou UUID (32 chiffres hexadécimaux) attendu%s"
+                            % (v, INVALID_OPT_MSG))
+    elif k == "sec":
+        flavors = v.split(":")
+        if not v or any(f not in SEC_FLAVORS for f in flavors):
+            raise PermError("sec=%s : saveurs sys, krb5, krb5i, krb5p séparées par « : »%s" % (v, INVALID_OPT_MSG))
+    elif k in ("mountpoint", "mp"):
+        if not v.startswith("/"):
+            raise PermError("%s=%s : chemin absolu attendu%s" % (k, v, INVALID_OPT_MSG))
+    elif k in ("refer", "replicas"):
+        if not v:
+            raise PermError("%s= vide%s" % (k, INVALID_OPT_MSG))
+
+
+def validate_sharenfs(value, with_lines=False):
+    """Valide une valeur sharenfs comme OpenZFS (clés, découpage des hôtes) et comme nfs-utils (valeurs
+    d'options, hôtes non vides), puis refuse les constructions ambiguës (sec= après les hôtes, IPv6 sans
+    crochets, netgroup)."""
     value = str(value).strip()
     if value in ("on", "off"):
-        return value
+        return (value, sharenfs_lines(value)) if with_lines else value
     if not SHARENFS_CHARS.fullmatch(value):
         raise PermError("Valeur sharenfs refusée : caractères autorisés A-Z a-z 0-9 _ = , . : @ / * - [ ] "
                         "(pas d'espace, de « ; » ni de retour à la ligne)")
-    for o in value.split(","):
-        if not o:
-            continue
-        k = o.partition("=")[0]
+    opts = [o for o in value.split(",") if o]
+    if len(opts) != len(value.split(",")):
+        raise PermError("Option vide dans %r (virgule en trop)" % value)
+    for i, o in enumerate(opts):
+        k, eq, v = o.partition("=")
         if k.startswith("-") or k not in SHARENFS_KEYS:
-            raise PermError("Option sharenfs inconnue d'OpenZFS : %s (le partage échouerait : SA_SYNTAX_ERR)" % k)
-    return value
+            raise PermError("Option sharenfs inconnue : %s (OpenZFS : SA_SYNTAX_ERR, ou exportfs l'ignorerait)%s"
+                            % (k, INVALID_OPT_MSG if k == "fsuid" else ""))
+        _check_option_value(k, eq, v)
+        if k in ("rw", "ro"):
+            if eq and v == "":
+                raise PermError("%s= sans hôte : nfs-utils exporterait à TOUS les clients ; écrivez « %s » seul "
+                                "si c'est voulu" % (k, k))
+            if eq:
+                hosts = _oz_split_hosts(v)
+                for h in hosts:
+                    _check_host(h["raw"], h["bracketed"], v)
+                plain = [h["raw"] for h in hosts if not h["bracketed"]]
+                run_hex = 0
+                for x in plain:
+                    run_hex = run_hex + 1 if re.fullmatch(r"@?[0-9A-Fa-f]{1,4}", x) else 0
+                    if run_hex >= 3:
+                        raise PermError("%r ressemble à une adresse IPv6 sans crochets (OpenZFS la découperait sur "
+                                        "« : ») : écrivez [adresse] ou [réseau]/n" % v)
+        elif k == "sec":
+            if not any(x.partition("=")[0] in ("rw", "ro") for x in opts[i + 1:]):
+                raise PermError("sec=%s placé après les hôtes : OpenZFS n'applique sec= qu'aux rw= / ro= qui le "
+                                "SUIVENT, ces hôtes resteraient en sec=sys. Placez sec= avant rw= / ro=" % v)
+    lines = sharenfs_lines(value)
+    return (value, lines) if with_lines else value
+
+
+def _effective_inheritors(rows, root_name, new_value_local):
+    """Datasets dont le sharenfs effectif sera celui de `root_name` : lui-même et les descendants qui en
+    héritent (aucune valeur locale ou reçue entre eux)."""
+    affected = []
+    blocked = []
+    for r in rows:
+        n = r["name"]
+        if n != root_name and not n.startswith(root_name + "/"):
+            continue
+        if any(n.startswith(b + "/") for b in blocked):
+            continue
+        if n != root_name and r["sharenfs_source"] in ("local", "received"):
+            blocked.append(n)
+            continue
+        affected.append(r)
+    return affected
+
+
+def _parent_sharenfs(dataset):
+    if "/" not in dataset:
+        return "off"
+    parent = dataset.rsplit("/", 1)[0]
+    _c, out, _e = run(["zfs", "get", "-H", "-o", "value", "sharenfs", parent], check=False)
+    return out.strip() or "off"
 
 
 def cmd_nfs_sharenfs(params):
@@ -2919,7 +3175,8 @@ def cmd_nfs_sharenfs(params):
     if not DATASET_CHARS.fullmatch(dataset or "") or dataset.startswith("-"):
         raise PermError("Nom de dataset invalide")
     op = params.get("op", "set")
-    rows = [r for r in _list_datasets(dataset) if r["name"] == dataset]
+    all_rows = _list_datasets(dataset)
+    rows = [r for r in all_rows if r["name"] == dataset]
     if not rows:
         raise PermError("Dataset introuvable : %s" % dataset)
     r = rows[0]
@@ -2929,24 +3186,62 @@ def cmd_nfs_sharenfs(params):
     if op == "set":
         value = validate_sharenfs(params.get("value", ""))
         cmd = ["zfs", "set", "sharenfs=%s" % value, dataset]
-        if value != "off" and r["path"]:
-            manual = [e for e in read_exports() if e["path"] == r["path"] and e["source"] == "manuel"]
-            if manual and not params.get("force"):
-                raise PermError("%s est déjà exporté par %s : retirez cette ligne d'abord (ou forcez)" % (
-                    r["path"], ", ".join(sorted({e["file"] for e in manual}))))
-            if _opt_value(value.split(","), "fsid"):
-                notes.append("fsid dans sharenfs : les enfants en hériteront (même fsid) ; redéfinissez-le sur chacun")
-            if _sharenfs_world_rw(value):
-                notes.append("ATTENTION : exporté vers tous les clients (*)")
+        new_value = value
     elif op == "inherit":
         cmd = ["zfs", "inherit", "sharenfs", dataset]
+        new_value = _parent_sharenfs(dataset)
+        notes.append("Après « zfs inherit », la valeur effective sera celle du parent : %s" % new_value)
     else:
         raise PermError("Opération inconnue : %s" % op)
+    affected = _effective_inheritors(all_rows, dataset, new_value)
+    for a in affected:
+        if a["path"] and a["path"] in SYSTEM_MOUNTS and new_value not in ("off", "-", "") \
+                and not params.get("allow_system"):
+            raise PermError("%s est monté sur %s (dataset système) : l'exporter par sharenfs est refusé" % (
+                a["name"], a["path"]))
+    preview = []
+    if new_value not in ("off", "-", ""):
+        exports = read_exports()
+        conflicts = []
+        for a in affected:
+            if not a["path"]:
+                continue
+            real = os.path.realpath(a["path"])
+            manual = [e for e in exports if e["source"] == "manuel" and e.get("realpath", e["path"]) == real]
+            if manual:
+                conflicts.append("%s (%s)" % (a["path"], ", ".join(sorted({e["file"] for e in manual}))))
+            if a["mounted"]:
+                try:
+                    preview += [l["line"] for l in sharenfs_lines(new_value, a["path"])]
+                except PermError as e:
+                    notes.append("La valeur héritée %r serait refusée par OpenZFS : %s" % (new_value, e))
+        if conflicts and not params.get("force"):
+            raise PermError("Déjà exporté par /etc/exports ou /etc/exports.d (doublon) : %s — retirez ces lignes "
+                            "d'abord (ou forcez)" % "; ".join(conflicts))
+        if conflicts:
+            notes.append("Doublons forcés : %s" % "; ".join(conflicts))
+        fsid_new = _opt_value(new_value.split(","), "fsid")
+        if fsid_new:
+            notes.append("fsid dans sharenfs : les enfants en hériteront (même fsid) ; redéfinissez-le sur chacun")
+        world = _sharenfs_world(new_value)
+        if world:
+            notes.append("ATTENTION : exporté vers TOUS les clients (*) en %s" % " et ".join(
+                "lecture-écriture" if a == "rw" else "lecture seule" for a in sorted(world, reverse=True)))
+    if r["sharenfs"] not in ("off", "-", "") and new_value != r["sharenfs"] and \
+            _opt_value(new_value.split(","), "fsid") != _opt_value(r["sharenfs"].split(","), "fsid"):
+        notes.append("Le fsid change : les filehandles changent, les clients déjà montés recevront ESTALE "
+                     "(démontez puis remontez-les)")
+    if len(affected) > 1:
+        notes.append("S'applique aussi aux descendants qui en héritent : %s" % ", ".join(
+            a["name"] for a in affected if a["name"] != dataset))
+    shown = " ".join(shlex.quote(x) for x in cmd)
+    res = {"command": shown, "notes": notes, "affected": [a["name"] for a in affected], "preview": preview}
     if params.get("dry_run", True):
-        return {"dry_run": True, "command": " ".join(cmd), "notes": notes, "current": r["sharenfs"],
-                "current_source": r["sharenfs_source"]}
+        res.update(dry_run=True, current=r["sharenfs"], current_source=r["sharenfs_source"])
+        return res
     run(cmd)
-    return {"dry_run": False, "command": " ".join(cmd), "notes": notes}
+    res["dry_run"] = False
+    return res
 
 # --------------------------------------------------------------------------- main
 

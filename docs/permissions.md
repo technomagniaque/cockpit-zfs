@@ -89,7 +89,11 @@ du noyau traduit (`fs/nfsd/nfs4acl.c`). Le module reproduit cette traduction à 
   (`posix_state_to_acl` renvoie NULL, `nfsd_setattr` ne pose l'ACL par défaut que si elle est
   fournie) ; setuid / setgid / sticky sont conservés.
 - **Noms** : avec l'idmapping actif, un UID / GID sans nom part comme `Nobody-User` /
-  `Nobody-Group` (`nobody` par défaut, `[Mapping]` de idmapd.conf). L'affichage est numérique
+  `Nobody-Group` **brut, sans `@domaine`** (`nobody` par défaut, `[Mapping]` de idmapd.conf ;
+  rpc.idmapd, `idtonameres`). Domaine : `Domain` de idmapd.conf (valeur coupée au premier `#`
+  ou `;`, guillemets retirés, comme `conffile.c`), sinon nom canonique de l'hôte après le premier
+  point (comme `domain_from_dns` de libnfsidmap ; l'enregistrement DNS TXT `_nfsv4idmapdomain`
+  n'est pas consulté). L'affichage est numérique
   par défaut quand `nfs4_disable_idmapping` n'est pas explicitement `N` (défaut noyau `Y`).
 - **Sans ACL POSIX** (`acltype=off`, ou `nfsv4` sous Linux upstream) : knfsd n'annonce pas
   l'attribut ACL (`aclsupport = 0`, `fs/nfsd/nfs4xdr.c`) et refuse tout SETATTR d'ACL
@@ -129,7 +133,9 @@ Ce que montre le code :
 - **ACL en NFSv3** : le protocole NFSACL transmet l'ACL POSIX telle quelle
   (`fs/nfsd/nfs3acl.c`, `fs/nfs_common/nfsacl.c`), identifiants en numérique ; une ACL
   minimale reçoit `mask::` = droits du groupe ; au-delà de `NFS_ACL_MAX_ENTRIES` (1024) entrées
-  par ACL, `nfsacl_encode` renvoie EINVAL et GETACL échoue. Sans ACL POSIX, GETACL renvoie
+  par ACL, l'encodage NFSACL échoue et le serveur répond par une erreur système RPC : GETACL
+  échoue. En NFSv4.1, knfsd n'a pas ce plafond : la limite est la taille encodée de l'attribut
+  ACL côté client (environ 64 Kio). Sans ACL POSIX, GETACL renvoie
   l'ACL minimale du mode et SETACL échoue (`set_posix_acl` → EOPNOTSUPP). Vue « NFSv3 (nfsacl) »
   à côté de la vue NFSv4.1 dans « État & ACL ». Identique en 6.12 (UEK8) et en version actuelle.
 - **Points de montage** (`nfsd_cross_mnt`, identique en 6.12) : un client NFSv4 traverse vers
@@ -141,15 +147,47 @@ Ce que montre le code :
   pour tous ; OpenZFS écrit une ligne par hôte dans `/etc/exports.d/zfs.exports` avec
   `sec=sys` par défaut, `no_subtree_check` et `mountpoint` (export seulement si monté), sans fsid.
   La propriété est **héritée** : un `fsid=` dans un sharenfs hérité donne le même fsid aux enfants.
+  Hôtes découpés sur `:` (`foreach_nfs_host_cb`) ; le `@` est simplement retiré
+  (`get_linux_hostspec`).
+
+**Validation sharenfs** (le plugin est plus strict qu'OpenZFS, qui laisse passer des valeurs
+dangereuses) :
+
+- **hôte vide refusé** (`rw=10.0.0.1:`, `rw=`, IPv6 sans crochets comme `rw=@fd00::/64`) :
+  OpenZFS écrit une ligne sans hôte, que nfs-utils exporte à **tous** (« No host name given ») ;
+  l'IPv6 s'écrit entre crochets : `rw=[fd00::]/64`, `rw=[fd00::5]` ;
+- `@nom` qui n'est pas un réseau IPv4 refusé (un netgroup n'est pas représentable : OpenZFS
+  retirerait le `@` et en ferait un nom d'hôte) ;
+- `sec=` doit **précéder** les `rw=` / `ro=` auxquels il s'applique (OpenZFS ne l'applique qu'aux
+  hôtes qui le suivent ; placé après, les hôtes restent en `sec=sys`) ;
+- valeurs d'options validées (`anonuid` / `anongid` entiers, `fsid` entier / `root` / UUID,
+  `sec` parmi sys, krb5, krb5i, krb5p, `mountpoint` absolu, `=` interdit sur les booléens,
+  `fsuid` retiré) : une option invalide fait ignorer par exportfs la ligne **et toutes les
+  suivantes** de `zfs.exports` ;
+- doublon avec `/etc/exports` vérifié sur le dataset **et sur tous les descendants qui hériteront
+  de la valeur** (`zfs set` comme `zfs inherit`), chemins comparés après résolution des liens ;
+- datasets système (montés sur `/`, `/usr`, `/var`…) refusés ;
+- la simulation montre les lignes exactes que OpenZFS écrira dans `zfs.exports` et les datasets
+  concernés ; un changement de fsid avertit des ESTALE chez les clients montés.
+
+Doublons entre fichiers d'exports : pour un **même client**, c'est la **première** entrée lue qui
+gagne (`/etc/exports` avant `/etc/exports.d`, ordre versionsort ; les suivantes sont marquées
+`[IGNORED]`) ; pour des clients différents, toutes s'appliquent.
 
 Constats par dataset : enfant non exporté (erreur) ou atteint seulement via `crossmnt`
 (avertissement), montage séparé nécessaire en v3, doublon sharenfs + exports, fsid en double ou
 hérité, absence de fsid (conseil), export vers tous (`*`), `acltype` autre que `posixacl`,
 `xattr=dir`, ACL au-delà de la limite nfsacl (racine du dataset, ou toutes les ACL en option).
 
-**Générer les exports manquants** : lignes `/etc/exports` (chemin échappé comme OpenZFS,
-`fsid=<GUID du dataset>` unique et stable) ou valeurs `sharenfs` pour chaque dataset sans
-export. Rien n'est écrit : on copie les lignes puis `exportfs -ra`, ou on applique chaque
+**Générer les exports manquants** : lignes `/etc/exports` (chemin échappé comme OpenZFS, plus
+`"` en `\042`, `fsid=<GUID du dataset>` unique et stable après `zfs rename`) ou valeurs
+`sharenfs` pour chaque dataset sans export (`ro` par défaut comme exports(5), `sec=` placé
+avant les hôtes, IPv6 entre crochets, `*` non combinable avec d'autres clients, `@netgroup`
+refusé). Après une réplication (`zfs send | recv`), le GUID change : copiez la ligne d'export
+d'origine sur la réplique au lieu de la régénérer. Donner ou changer le fsid d'un dataset déjà
+exporté provoque des ESTALE chez les clients montés (démonter puis remonter). Les constats
+« enfant » se basent sur le **chemin de montage** (mountpoint personnalisé, `legacy`, `none`),
+pas sur le nom du dataset. Rien n'est écrit : on copie les lignes puis `exportfs -ra`, ou on applique chaque
 sharenfs depuis le panneau d'édition (simulation obligatoire, confirmation désarmée si un
 paramètre change, `zfs set` / `zfs inherit` avec valeur en liste blanche). Ne gérez pas un même
 chemin à la fois par sharenfs et par cockpit-file-sharing / `/etc/exports`.

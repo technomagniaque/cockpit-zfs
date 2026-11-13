@@ -177,6 +177,18 @@ export interface NfsDatasetsResult {
 	notes: string[];
 }
 
+export interface SharenfsPlan {
+	dry_run: boolean;
+	command: string;
+	notes: string[];
+	current?: string;
+	current_source?: string;
+	/** dataset et descendants qui hériteront de la valeur */
+	affected?: string[];
+	/** lignes que OpenZFS écrira dans /etc/exports.d/zfs.exports */
+	preview?: string[];
+}
+
 export interface NfsGenerateResult {
 	format: 'exports' | 'sharenfs';
 	lines: { name: string; line: string }[];
@@ -314,7 +326,7 @@ export const nfsDatasets = (dataset: string, scanAcls = false) =>
 export const nfsGenerate = (params: { dataset: string; clients: string[]; options?: string; format: 'exports' | 'sharenfs'; fsid?: 'guid' | 'none'; include_exported?: boolean }) =>
 	permissionsCall<NfsGenerateResult>('nfs-generate', params);
 export const nfsSharenfs = (params: { dataset: string; op: 'set' | 'inherit'; value?: string; dry_run: boolean; force?: boolean }) =>
-	permissionsCall<{ dry_run: boolean; command: string; notes: string[]; current?: string; current_source?: string }>('nfs-sharenfs', params);
+	permissionsCall<SharenfsPlan>('nfs-sharenfs', params);
 export const nfsv4Support = () => permissionsCall<Nfs4NativeSupport & { idmap: IdmapInfo }>('nfsv4-support');
 export const getMethods = () =>
 	permissionsCall<{ methods: Record<ResetMethod, string>; presets: Record<string, string> }>('methods');

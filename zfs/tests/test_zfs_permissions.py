@@ -848,7 +848,10 @@ class _Nfs4ReviewTests:
     def test_principal_sans_nom_devient_nobody(self):
         subprocess.run(["setfacl", "-m", "u:54321:r", self.p("a/f1")], check=True)
         d = self.ok("inspect", path=self.p("a/f1"))
-        self.assertTrue(any(":nobody@" in t for t in d["nfs4_view"]["text"]), d["nfs4_view"]["text"])
+        # rpc.idmapd envoie Nobody-User brut, sans @domaine
+        self.assertTrue(any(t.endswith(":nobody:rtcy") or ":nobody:" in t for t in d["nfs4_view"]["text"]),
+                        d["nfs4_view"]["text"])
+        self.assertFalse(any(":nobody@" in t for t in d["nfs4_view"]["text"]))
         self.assertTrue(any(":54321:" in t for t in d["nfs4_view"]["numeric_text"]))
 
 
@@ -875,7 +878,10 @@ FAKE_ZFS_NFS = textwrap.dedent(r"""
             for d in ds:
                 print("%s\t%s\t%s" % (d["name"], d["mountpoint"], d.get("mounted", "yes")))
     elif args[0] == "get":
-        if "sharenfs" in args and "-r" in args:
+        if args[-2] == "sharenfs" and "value" in args and "-r" not in args:
+            d = [x for x in ds if x["name"] == args[-1]]
+            print(d[0].get("sharenfs", "off") if d else "off")
+        elif "sharenfs" in args and "-r" in args:
             for d in sel(args[-1]):
                 print("%s\t%s\t%s" % (d["name"], d.get("sharenfs", "off"), d.get("src", "default")))
         else:
@@ -1026,7 +1032,8 @@ class NfsDatasetsTest(unittest.TestCase):
     def test_generer_sharenfs(self):
         d = self.ok("nfs-generate", dataset="tank/data", clients=["10.0.0.0/24", "hote1"], format="sharenfs")
         cmd = [c for c in d["commands"] if c["name"] == "tank/data"][0]
-        self.assertEqual(cmd["value"], "rw=@10.0.0.0/24:hote1,sync,no_subtree_check,sec=sys")
+        # sec= AVANT rw= (OpenZFS ne l'applique qu'aux hôtes qui le suivent)
+        self.assertEqual(cmd["value"], "sync,no_subtree_check,sec=sys,rw=@10.0.0.0/24:hote1")
         d = self.call("nfs-generate", dataset="tank/data", clients=["a;b"], format="exports")
         self.assertFalse(d["ok"])
         d = self.call("nfs-generate", dataset="tank/data", clients=["*"], options="rw,fsid=3")
@@ -1048,6 +1055,126 @@ class NfsDatasetsTest(unittest.TestCase):
         self.assertFalse(self.call("nfs-sharenfs", dataset="-r tank", value="on")["ok"])
         self.assertFalse(self.call("nfs-datasets", dataset="-r")["ok"])
         self.assertFalse(self.call("nfs-generate", dataset="-r", clients=["*"])["ok"])
+
+    # ------------------------------------------------------------------ revue de e77d3fd
+
+    def test_hote_vide_et_ipv6(self):
+        """H1 : un hôte vide (« : » en trop, IPv6 sans crochets) exporterait vers tous en rw."""
+        for bad in ("rw=10.0.0.1:", "rw=@fd00::/64", "rw=fd00::5", "rw=", "rw=:10.0.0.1",
+                    "rw=2001:db8:1:2:3:4:5:6", "rw=@nfsclients", "rw=-x", "rw=[fd00::",
+                    "rw=[zzzz::1]", "ro=10.0.0.1::10.0.0.2"):
+            d = self.call("nfs-sharenfs", dataset="tank/data/child", value=bad)
+            self.assertFalse(d["ok"], bad)
+        for good in ("rw=[fd00::]/64", "rw=[fd00::5]:10.0.0.1", "ro=@10.0.0.0/8:hote.example.org",
+                     "sec=krb5p,rw=@10.0.0.0/24", "ro", "rw=*"):
+            self.ok("nfs-sharenfs", dataset="tank/data/child", value=good)
+        # simulation fidèle à OpenZFS
+        lines = ZP.sharenfs_lines("rw=[fd00::]/64:10.0.0.1", "/t")
+        self.assertEqual([l["host"] for l in lines], ["fd00::/64", "10.0.0.1"])
+        self.assertEqual([l["host"] for l in ZP.sharenfs_lines("rw=10.0.0.1:", "/t")], ["10.0.0.1", ""])
+
+    def test_detection_export_vers_tous(self):
+        self.assertEqual(ZP._sharenfs_world("on"), {"rw"})
+        self.assertEqual(ZP._sharenfs_world("ro"), {"ro"})
+        self.assertEqual(ZP._sharenfs_world("rw=*"), {"rw"})
+        self.assertEqual(ZP._sharenfs_world("ro,rw=10.0.0.1"), {"ro"})
+        self.assertEqual(ZP._sharenfs_world("rw=10.0.0.1:"), {"rw"})
+        self.assertEqual(ZP._sharenfs_world("rw=10.0.0.1"), set())
+        self.assertEqual(ZP._sharenfs_world("crossmnt"), set())   # aucun rw / ro : rien d'exporté
+
+    def test_generateur_ipv6_netgroup_etoile(self):
+        d = self.ok("nfs-generate", dataset="tank/data", clients=["fd00::/64", "10.0.0.5", "fd00::7"],
+                    format="sharenfs", options="sync,sec=krb5p")
+        v = [c for c in d["commands"] if c["name"] == "tank/data"][0]["value"]
+        self.assertEqual(v, "sync,sec=krb5p,ro=[fd00::]/64:10.0.0.5:[fd00::7]")   # ro par défaut
+        hosts = [l["host"] for l in ZP.sharenfs_lines(v, "/t")]
+        self.assertEqual(hosts, ["fd00::/64", "10.0.0.5", "fd00::7"])
+        self.assertTrue(all(l["sec"] == "krb5p" for l in ZP.sharenfs_lines(v, "/t")))
+        self.assertFalse(self.call("nfs-generate", dataset="tank/data", clients=["@netgroupe"],
+                                   format="sharenfs")["ok"])
+        self.assertFalse(self.call("nfs-generate", dataset="tank/data", clients=["*", "10.0.0.1"],
+                                   format="sharenfs")["ok"])
+        self.assertFalse(self.call("nfs-generate", dataset="tank/data", clients=["-x"], format="exports")["ok"])
+
+    def test_sec_apres_hotes_refuse(self):
+        """H2"""
+        d = self.call("nfs-sharenfs", dataset="tank/data/child", value="rw=@10.0.0.0/24,sec=krb5p")
+        self.assertFalse(d["ok"])
+        self.assertIn("SUIVENT", d["error"])
+
+    def test_valeurs_options(self):
+        """M1"""
+        for bad in ("rw,sync=1", "rw,anonuid=abc", "rw,fsid=xyz", "rw,sec=foo,ro", "sec=sys:bad,rw",
+                    "rw,fsuid=0", "rw,mountpoint=relatif", "rw,anonuid=99999999999", "rw,crossmnt=yes",
+                    "rw,anonuid", "rw,,sync"):
+            d = self.call("nfs-sharenfs", dataset="tank/data/child", value=bad)
+            self.assertFalse(d["ok"], bad)
+        for good in ("rw,anonuid=65534,anongid=65534", "rw,fsid=12", "rw,fsid=root",
+                     "rw,fsid=00000000-0000-0000-0000-000000000457", "sec=krb5:krb5i,rw", "rw,mountpoint",
+                     "rw,mp=/tank/data/child"):
+            self.ok("nfs-sharenfs", dataset="tank/data/child", value=good)
+
+    def test_doublon_sur_descendants_herites(self):
+        """M3 : sharenfs sur le parent hérité par un enfant déjà dans /etc/exports."""
+        self.write_exports("%s 10.0.0.0/24(rw,fsid=9)\n" % self.p("child"))
+        d = self.call("nfs-sharenfs", dataset="tank/data", value="rw=@10.0.0.0/24")
+        self.assertFalse(d["ok"])
+        self.assertIn(self.p("child"), d["error"])
+        # un enfant avec une valeur locale bloque l'héritage
+        self.set_datasets([
+            {"name": "tank/data", "mountpoint": self.root, "guid": 1111},
+            {"name": "tank/data/child", "mountpoint": self.p("child"), "guid": 2222, "sharenfs": "off",
+             "src": "local"},
+        ])
+        d = self.ok("nfs-sharenfs", dataset="tank/data", value="rw=@10.0.0.0/24")
+        self.assertEqual(d["affected"], ["tank/data"])
+        # inherit : la valeur du parent serait héritée par l'enfant déjà exporté
+        self.set_datasets([
+            {"name": "tank", "mountpoint": self.tmp, "guid": 1, "sharenfs": "rw=@10.0.0.0/24", "src": "local"},
+            {"name": "tank/data", "mountpoint": self.root, "guid": 1111, "sharenfs": "off", "src": "local"},
+            {"name": "tank/data/child", "mountpoint": self.p("child"), "guid": 2222, "sharenfs": "off",
+             "src": "inherited from tank/data"},
+        ])
+        d = self.call("nfs-sharenfs", dataset="tank/data", op="inherit")
+        self.assertFalse(d["ok"])
+        self.assertIn(self.p("child"), d["error"])
+
+    def test_dataset_systeme_refuse(self):
+        """M6"""
+        self.set_datasets([{"name": "rpool/ROOT/pve-1", "mountpoint": "/", "guid": 7}])
+        d = self.call("nfs-sharenfs", dataset="rpool/ROOT/pve-1", value="on")
+        self.assertFalse(d["ok"])
+        self.assertIn("système", d["error"])
+
+    def test_echappement_guillemet(self):
+        """M5"""
+        self.assertEqual(ZP.escape_export_path('/tank/a"b c'), "/tank/a\\042b\\040c")
+        e = ZP.parse_exports_text(ZP.escape_export_path('/tank/a"b c') + " h(rw)\n", "/etc/exports")
+        self.assertEqual(e[0]["path"], '/tank/a"b c')
+
+    def test_parse_exports_diese_et_guillemets(self):
+        e = ZP.parse_exports_text('/tank/a#b h(rw) # commentaire\n"/tank/q x"  h2(ro)\n', "/etc/exports")
+        self.assertEqual(e[0]["path"], "/tank/a#b")
+        self.assertEqual([c["host"] for c in e[0]["clients"]], ["h"])
+        self.assertEqual(e[1]["path"], "/tank/q x")
+
+    def test_hierarchie_par_chemin(self):
+        """Parent déterminé par le chemin de montage, pas par le nom."""
+        os.makedirs(os.path.join(self.tmp, "ailleurs"))
+        self.set_datasets([
+            {"name": "tank/data", "mountpoint": self.root, "guid": 1111},
+            # enfant par le nom mais monté hors du parent : pas « caché » sous lui
+            {"name": "tank/data/child", "mountpoint": os.path.join(self.tmp, "ailleurs"), "guid": 2222},
+            # autre branche par le nom, mais montée DANS le parent
+            {"name": "tank/autre", "mountpoint": self.p("child2"), "guid": 3333},
+            {"name": "tank/data/leg", "mountpoint": "legacy", "guid": 4444, "mounted": "no"},
+        ])
+        self.write_exports("%s 10.0.0.0/24(rw,fsid=1)\n" % self.root)
+        rows = {r["name"]: r for r in self.ok("nfs-datasets", dataset="tank")["datasets"]}
+        codes = lambda n: {f["code"] for f in rows[n]["findings"]}
+        self.assertNotIn("hidden_child", codes("tank/data/child"))
+        self.assertIn("hidden_child", codes("tank/autre"))
+        self.assertIn("not_mounted", codes("tank/data/leg"))
 
     def test_parse_exports(self):
         e = ZP.parse_exports_text('/a\\040b host1(rw,sync) -ro \\\n  host2 "/q x" (rw)\n# c\n/z (rw)\n', "/etc/exports")

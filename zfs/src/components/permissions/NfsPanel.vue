@@ -137,6 +137,13 @@
 				<div class="font-mono text-default">{{ sharenfsPlan.command }}</div>
 				<div v-if="sharenfsPlan.current !== undefined" class="text-muted">Actuel : {{ sharenfsPlan.current }} ({{ sharenfsPlan.current_source }})</div>
 				<ul class="list-disc pl-5 text-muted"><li v-for="n in sharenfsPlan.notes" :key="n">{{ n }}</li></ul>
+				<div v-if="sharenfsPlan.affected && sharenfsPlan.affected.length > 1" class="text-muted">
+					Datasets concernés : <span class="font-mono">{{ sharenfsPlan.affected.join(', ') }}</span>
+				</div>
+				<div v-if="sharenfsPlan.preview && sharenfsPlan.preview.length" class="mt-1">
+					<div class="text-muted">Lignes que OpenZFS écrira dans /etc/exports.d/zfs.exports :</div>
+					<pre class="font-mono whitespace-pre-wrap text-default">{{ sharenfsPlan.preview.join('\n') }}</pre>
+				</div>
 			</div>
 		</div>
 	</div>
@@ -146,7 +153,7 @@
 import { ref, reactive, computed, watch } from 'vue';
 import { pushNotification, Notification } from '@45drives/houston-common-ui';
 import {
-	type NfsDatasetsResult, type NfsGenerateResult, type NfsDataset,
+	type NfsDatasetsResult, type NfsGenerateResult, type NfsDataset, type SharenfsPlan,
 	nfsDatasets, nfsGenerate, nfsSharenfs,
 } from '../../composables/permissions';
 
@@ -161,7 +168,7 @@ const gen = reactive({ format: 'exports' as 'exports' | 'sharenfs', clients: '',
 const generated = ref<NfsGenerateResult | null>(null);
 
 const edit = reactive({ dataset: '', op: 'set' as 'set' | 'inherit', value: '', force: false });
-const sharenfsPlan = ref<{ dry_run: boolean; command: string; notes: string[]; current?: string; current_source?: string } | null>(null);
+const sharenfsPlan = ref<SharenfsPlan | null>(null);
 const simulatedKey = ref('');
 const editKey = computed(() => JSON.stringify([edit.dataset, edit.op, edit.value, edit.force]));
 // la confirmation n'est armée qu'après une simulation réussie des paramètres actuels

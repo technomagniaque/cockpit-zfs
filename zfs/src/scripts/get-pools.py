@@ -186,6 +186,71 @@ def _parse_vdevs_from_status(pool_name):
         return {"data": [], "cache": [], "dedup": [], "log": [], "spare": [], "special": []}
 
 
+def _parse_bool_cli(val, default=False):
+    s = str(val).strip().lower()
+    if s in ("on", "yes", "true", "1"):
+        return True
+    if s in ("off", "no", "false", "0"):
+        return False
+    return default
+
+
+def _parse_int_cli(val, default=0):
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _pool_extra_props_cli(pool_name):
+    out = {}
+    res = subprocess.run(
+        ["zpool", "get", "-Hp", "autoexpand,autoreplace,autotrim,delegation,listsnapshots,readonly,failmode,altroot,ashift,comment", pool_name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+    )
+    if res.returncode == 0:
+        for line in res.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                out[parts[1]] = parts[2]
+    return out
+
+
+def _pool_root_dataset_cli(pool_name):
+    res = subprocess.run(
+        ["zfs", "get", "-Hp", "recordsize,compression,dedup,refreservation,available,used", pool_name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+    )
+    if res.returncode != 0:
+        return None
+    props = {}
+    for line in res.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            props[parts[1]] = parts[2]
+    if not props:
+        return None
+    rec_bytes = _parse_int_cli(props.get("recordsize"), 131072)
+    if rec_bytes >= 1024 and rec_bytes % 1024 == 0:
+        rec_val = f"{rec_bytes // 1024}K" if rec_bytes < 1048576 else f"{rec_bytes // 1048576}M"
+    else:
+        rec_val = str(rec_bytes)
+    comp_val = props.get("compression", "off")
+    dedup_val = props.get("dedup", "off")
+    return {
+        "name": pool_name,
+        "properties": {
+            "recordsize": {"parsed": rec_bytes, "value": rec_val},
+            "compression": {"parsed": comp_val if comp_val != "off" else False, "value": comp_val},
+            "dedup": {"parsed": dedup_val, "value": dedup_val},
+            "refreservation": {"parsed": _parse_int_cli(props.get("refreservation"), 0), "value": props.get("refreservation", "0")},
+            "available": {"parsed": _parse_int_cli(props.get("available"), 0), "value": props.get("available", "0")},
+            "used": {"parsed": _parse_int_cli(props.get("used"), 0), "value": props.get("used", "0")},
+        },
+        "children": [],
+    }
+
+
 def _pools_from_zpool_list_min():
     """Permission-friendly fallback when libzfs /dev/zfs is blocked."""
     try:
@@ -203,6 +268,7 @@ def _pools_from_zpool_list_min():
             if not line:
                 continue
             name, size, alloc, cap, free, health, guid = line.split()
+            extra = _pool_extra_props_cli(name)
             pools.append({
                 "name": name,
                 "status": health,
@@ -213,18 +279,18 @@ def _pools_from_zpool_list_min():
                     "capacity": {"rawvalue": int(cap.rstrip("%"))},
                     "free": {"parsed": int(free)},
                     "health": {"parsed": health},
-                    "autoexpand": {"parsed": False},
-                    "autoreplace": {"parsed": False},
-                    "autotrim": {"parsed": "off"},
-                    "delegation": {"parsed": True},
-                    "listsnapshots": {"parsed": False},
-                    "readonly": {"parsed": False},
-                    "failmode": {"parsed": "wait"},
-                    "altroot": {"value": "-"},
-                    "ashift": {"rawvalue": "0"},
-                    "comment": {"value": "-"},
+                    "autoexpand": {"parsed": _parse_bool_cli(extra.get("autoexpand"), False)},
+                    "autoreplace": {"parsed": _parse_bool_cli(extra.get("autoreplace"), False)},
+                    "autotrim": {"parsed": extra.get("autotrim", "off")},
+                    "delegation": {"parsed": _parse_bool_cli(extra.get("delegation"), True)},
+                    "listsnapshots": {"parsed": _parse_bool_cli(extra.get("listsnapshots"), False)},
+                    "readonly": {"parsed": _parse_bool_cli(extra.get("readonly"), False)},
+                    "failmode": {"parsed": extra.get("failmode", "wait")},
+                    "altroot": {"value": extra.get("altroot", "-")},
+                    "ashift": {"rawvalue": extra.get("ashift", "0")},
+                    "comment": {"value": extra.get("comment", "-")},
                 },
-                "root_dataset": None,
+                "root_dataset": _pool_root_dataset_cli(name),
                 "scan": {
                     "function": None, "start_time": None, "end_time": None, "pause": None,
                     "state": None, "errors": 0, "percentage": 0,

@@ -207,11 +207,26 @@ Limites connues du repli CLI :
 - Import de pools (`zpool import` / `zpool import -D`, analysés avec `LC_ALL=C`) : `zpool import` n'affiche ni
   les GUID des vdevs ni leurs compteurs d'erreurs ; ces champs restent vides / à zéro. Le GUID du pool, son
   état, sa topologie (data, log, cache, spare, special, dedup) et l'état de chaque vdev sont fidèles.
+- `get-pools.py` / `get-scan-stats.py` : un `zpool status -P -p` par pool (`LC_ALL=C`) donne `status_code`
+  (noms de `zpool_status_t` : `MISSING_DEV_R`, `FAULTED_DEV_NR`, `RESILVERING`, `FEAT_DISABLED`…),
+  `status_detail` (message « status: »), `error_count` (« N data errors »), le scan (scrub / resilver, état,
+  pause, pourcentage, octets, temps restant) et l'arborescence des vdevs avec leurs compteurs READ/WRITE/CKSUM.
+  Un message « status: » inconnu donne `UNKNOWN` (alerte affichée avec le message brut).
+- `get-snapshots.py` : `value` lisible (`zfs list -Ho`), `rawvalue` brute, `parsed` typée ; une erreur de
+  `zfs list` sort sur stderr avec un code non nul.
 
-Paquets Debian 13 recommandés :
+Paquet Debian 13 (`packaging/debian-trixie/control.j2`, clé `debian_trixie` du manifeste) :
+
+- Depends : cockpit, `zfsutils-linux`, `python3`, `acl`, `attr`, `python3-pip`, `sqlite3`, `jq`, `msmtp`,
+  `python3-dateutil` ;
+- Recommends : `cockpit-alerts` (page `/alerts` des notifications), `nfs4-acl-tools` (vérification NFSv4.1),
+  `nfs-kernel-server`, `nfs-common` (sharenfs) ;
+- Suggests : `python3-libzfs` (dépôts 45Drives ; les scripts fonctionnent sans).
+
+Le paquet Bookworm (`debian_common`) garde ses dépendances d'origine (`python3-libzfs`, `cockpit-alerts`) plus `acl`.
 
 ```bash
-apt install zfsutils-linux acl attr nfs4-acl-tools nfs-kernel-server nfs-common
+apt install zfsutils-linux acl attr nfs4-acl-tools nfs-kernel-server nfs-common cockpit-alerts
 ```
 
 ## Tests

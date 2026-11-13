@@ -58,132 +58,288 @@ def get_logger(name: str, file_basename: str, app_name: str = "cockpit-zfs") -> 
 
 logger = get_logger("cockpit_zfs_getpools", "getpools.log")
 
-def _parse_vdevs_from_status(pool_name):
-    """Parse VDev tree from 'zpool status' output for a given pool."""
+# --- repli CLI : analyse de `zpool status` (même forme JSON que libzfs) ---
+import re, time
+from datetime import datetime
+
+_CLI_ENV = dict(os.environ, LC_ALL="C", LANG="C")
+_EMPTY_GROUPS = ("data", "cache", "dedup", "log", "spare", "special")
+_SECTION_MAP = {"logs": "log", "log": "log", "cache": "cache", "spares": "spare", "spare": "spare",
+                "special": "special", "dedup": "dedup"}
+_VDEV_RE = re.compile(r"^(mirror|raidz[0-3]?|draid[0-3]?(?::[^-\s]+)?|replacing|spare|indirect)(?:-\d+)?$")
+_HDR_RE = re.compile(r"^\s*(pool|id|state|status|action|see|scan|remove|checkpoint|compatibility|config|errors):(?:\s(.*))?$")
+_SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)([BKMGTPEZ]?)$")
+_UNITS = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40, "P": 1 << 50, "E": 1 << 60, "Z": 1 << 70}
+
+
+def _size_to_bytes(text):
+    """« 1.23T » ou « 1352331264 » (zpool status -p) -> octets (int)."""
+    m = _SIZE_RE.match(str(text).strip())
+    if not m:
+        return 0
+    return int(float(m.group(1)) * _UNITS[m.group(2)])
+
+
+def _parse_date(text):
+    """« Sun Nov  8 00:24:02 2026 » (heure locale) -> « 2026-11-08 00:24:02-05:00 » (comme str(datetime) de libzfs, avec fuseau)."""
     try:
-        res = subprocess.run(
-            ["zpool", "status", "-P", pool_name],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
-        )
-        if res.returncode != 0:
-            logger.error(f"zpool status {pool_name} failed: {res.stderr.strip()}")
-            return {"data": [], "cache": [], "dedup": [], "log": [], "spare": [], "special": []}
+        t = time.strptime(" ".join(str(text).split()), "%a %b %d %H:%M:%S %Y")
+        return datetime(*t[:6]).astimezone().isoformat(sep=" ")
+    except (ValueError, TypeError):
+        return None
 
-        lines = res.stdout.splitlines()
-        groups = {"data": [], "cache": [], "dedup": [], "log": [], "spare": [], "special": []}
-        in_config = False
-        current_section = "data"
-        section_map = {
-            "cache": "cache",
-            "log": "log",
-            "dedup": "dedup",
-            "spare": "spare",
-            "special": "special",
+
+def _duration_secs(text):
+    """« 00:10:05 » ou « 1 days 02:03:04 » -> secondes."""
+    m = re.search(r"(?:(\d+)\s+days?\s+)?(\d+):(\d{2}):(\d{2})", str(text))
+    if not m:
+        return None
+    return int(m.group(1) or 0) * 86400 + int(m.group(2)) * 3600 + int(m.group(3)) * 60 + int(m.group(4))
+
+
+def _empty_scan():
+    return {
+        "function": None, "start_time": "None", "end_time": "None", "pause": "None",
+        "state": None, "errors": 0, "percentage": 0,
+        "total_secs_left": 0, "bytes_issued": 0, "bytes_processed": 0, "bytes_to_process": 0,
+    }
+
+
+def parse_scan(lines):
+    """Ligne « scan: » de zpool status (+ continuations) -> dict scan au format libzfs.
+
+    percentage en pourcents (0-100) comme libzfs ; dates au format str(datetime) avec fuseau.
+    """
+    scan = _empty_scan()
+    text = " ".join(" ".join(lines).split())
+    if not text or text.startswith("none requested"):
+        return scan
+    if text.startswith("resilver") or " resilvered" in " " + text.split(",")[0]:
+        scan["function"] = "RESILVER"
+    elif text.startswith("scrub"):
+        scan["function"] = "SCRUB"
+    else:
+        return scan
+    date = r"(\w{3} \w{3} +\d+ \d{2}:\d{2}:\d{2} \d{4})"
+    m = re.search(r"(?:repaired|resilvered) (\S+) in (.+?) with (\d+) errors? on " + date, text)
+    if m:
+        scan["state"] = "FINISHED"
+        scan["end_time"] = _parse_date(m.group(4)) or "None"
+        scan["errors"] = int(m.group(3))
+        secs = _duration_secs(m.group(2))
+        try:
+            if secs is not None and scan["end_time"] != "None":
+                end = datetime.fromisoformat(scan["end_time"])
+                scan["start_time"] = datetime.fromtimestamp(end.timestamp() - secs).astimezone().isoformat(sep=" ")
+        except ValueError:
+            pass
+        scan["percentage"] = 100.0
+        return scan
+    m = re.search(r"canceled on " + date, text)
+    if m:
+        scan["state"] = "CANCELED"
+        scan["end_time"] = _parse_date(m.group(1)) or "None"
+        return scan
+    m = re.search(r"in progress since " + date, text)
+    if m:
+        scan["state"] = "SCANNING"
+        scan["start_time"] = _parse_date(m.group(1)) or "None"
+    m = re.search(r"paused since " + date, text)
+    if m:
+        scan["state"] = "SCANNING"
+        scan["pause"] = _parse_date(m.group(1)) or "None"
+        m2 = re.search(r"started on " + date, text)
+        if m2:
+            scan["start_time"] = _parse_date(m2.group(1)) or "None"
+    if scan["state"] is None:
+        return scan
+    m = re.search(r"(\S+) / (\S+) scanned", text) or re.search(r"(\S+) scanned out of (\S+)", text)
+    if m:
+        scan["bytes_processed"] = _size_to_bytes(m.group(1))
+        scan["bytes_to_process"] = _size_to_bytes(m.group(2))
+    m = re.search(r"(\S+) / \S+ issued", text) or re.search(r"(\S+) issued", text)
+    if m:
+        scan["bytes_issued"] = _size_to_bytes(m.group(1))
+    m = re.search(r"(\d+(?:\.\d+)?)% done", text)
+    if m:
+        scan["percentage"] = float(m.group(1))
+    m = re.search(r"((?:\d+\s+days?\s+)?\d+:\d{2}:\d{2}) to go", text)
+    if m:
+        scan["total_secs_left"] = _duration_secs(m.group(1)) or 0
+    return scan
+
+
+def split_status_sections(text):
+    """Découpe la sortie de `zpool status <pool>` en sections (pool, state, status, action, scan, config, errors…)."""
+    sections = {}
+    key = None
+    for line in text.splitlines():
+        m = _HDR_RE.match(line)
+        if m and (key != "config" or m.group(1) == "errors"):
+            key = m.group(1)
+            first = (m.group(2) or "").strip()
+            sections[key] = [first] if first else []
+            continue
+        if key:
+            sections[key].append(line if key == "config" else line.strip())
+    return sections
+
+
+# Messages « status: » de zpool_status_t (libzfs_status.c / zpool_main.c), du plus spécifique au plus général
+_STATUS_CODES = [
+    ("currently being resilvered", "RESILVERING"),
+    ("is currently being rebuilt", "REBUILDING"),
+    ("could not be opened", None),               # MISSING_DEV_R / _NR selon « Sufficient replicas »
+    ("are missing from the system", None),
+    ("label is missing or invalid", None),       # CORRUPT_LABEL_R / _NR
+    ("faulted in response to persistent errors", None),  # FAULTED_DEV_R / _NR
+    ("are faulted", None),
+    ("has been removed", "REMOVED_DEV"),
+    ("has been taken offline", "OFFLINE_DEV"),
+    ("unrecoverable error", "FAILING_DEV"),
+    ("resulting in data corruption", "CORRUPT_DATA"),
+    ("metadata is corrupted", "CORRUPT_POOL"),
+    ("suspended", "IO_FAILURE_WAIT"),
+    ("intent log", "BAD_LOG"),
+    ("errata", "ERRATA"),
+    ("features are not enabled", "FEAT_DISABLED"),
+    ("on-disk format", "VERSION_OLDER"),
+    ("configured to use a non-native block size", "NON_NATIVE_ASHIFT"),
+    ("compatibility", "COMPATIBILITY_ERR"),
+]
+
+
+def status_code_from_sections(sections, health):
+    """(status_code, status_detail) proches de libzfs : « OK » seulement si zpool status n'annonce rien."""
+    detail = " ".join(" ".join(sections.get("status", [])).split())
+    if not detail:
+        if health in ("ONLINE", "", None):
+            return "OK", ""
+        return health, f"Pool {health}"
+    low = detail.lower()
+    replicas = "sufficient replicas" in low
+    for needle, code in _STATUS_CODES:
+        if needle in low:
+            if code is None:
+                base = "CORRUPT_LABEL" if "label" in needle else ("FAULTED_DEV" if "fault" in needle else "MISSING_DEV")
+                code = base + ("_R" if replicas else "_NR")
+            return code, detail
+    return "UNKNOWN", detail
+
+
+def error_count_from_sections(sections):
+    """« errors: No known data errors » -> 0 ; « errors: 12 data errors, use '-v' for a list » -> 12."""
+    text = " ".join(sections.get("errors", []))
+    m = re.search(r"(\d+)\s+data errors?", text)
+    return int(m.group(1)) if m else 0
+
+
+def _err_int(text):
+    return _size_to_bytes(text) if text not in (None, "-") else 0
+
+
+def parse_config_vdevs(pool_name, config_lines):
+    """Lignes de « config: » -> groupes de vdevs (data/log/cache/spare/special/dedup), arborescence par indentation."""
+    groups = {g: [] for g in _EMPTY_GROUPS}
+    section = "data"
+    stack = []  # [(indent, vdev)]
+    pool_seen = False
+    for line in config_lines:
+        if not line.strip():
+            continue
+        parts = line.split()
+        raw_name = parts[0]
+        if raw_name == "NAME" and "STATE" in parts:
+            continue
+        indent = len(line.expandtabs(8)) - len(line.expandtabs(8).lstrip())
+        if raw_name in _SECTION_MAP and len(parts) == 1:
+            section = _SECTION_MAP[raw_name]
+            stack = []
+            continue
+        if not pool_seen and raw_name == pool_name:
+            pool_seen = True
+            continue
+        status = parts[1] if len(parts) > 1 else "ONLINE"
+        is_vdev = bool(_VDEV_RE.match(raw_name))
+        if is_vdev:
+            t = _VDEV_RE.match(raw_name).group(1)
+            vtype = "raidz" if t.startswith("raidz") else ("draid" if t.startswith("draid") else t)
+            disk_path = None
+            name = raw_name
+        else:
+            vtype = "disk"
+            if raw_name.startswith("/dev/"):
+                disk_path = raw_name
+            else:
+                disk_path = next((pfx + raw_name for pfx in ("/dev/disk/by-path/", "/dev/disk/by-vdev/", "/dev/disk/by-id/", "/dev/")
+                                  if os.path.exists(pfx + raw_name)), f"/dev/{raw_name}")
+            name = os.path.basename(raw_name)
+        entry = {
+            "name": name,
+            "type": vtype,
+            "path": disk_path,
+            "status": status,
+            "guid": "",
+            "stats": {
+                "read_errors": _err_int(parts[2]) if len(parts) > 2 else 0,
+                "write_errors": _err_int(parts[3]) if len(parts) > 3 else 0,
+                "checksum_errors": _err_int(parts[4]) if len(parts) > 4 else 0,
+            },
+            "children": [],
         }
-        pool_line_seen = False
-        vdev_stack = []  # [(indent, vdev_dict)]
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if stack:
+            stack[-1][1]["children"].append(entry)
+        else:
+            groups[section].append(entry)
+        if is_vdev:
+            stack.append((indent, entry))
+    return groups
 
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("config:"):
-                in_config = True
-                continue
-            if not in_config:
-                continue
-            if stripped == "" or stripped.startswith("NAME") or stripped.startswith("errors:"):
-                if stripped.startswith("errors:"):
-                    in_config = False
-                continue
 
-            # Detect section headers (cache, log, dedup, spare, special)
-            if stripped in section_map:
-                current_section = section_map[stripped]
-                pool_line_seen = True
-                vdev_stack = []
-                continue
+def _zpool_status_cli(pool_name):
+    """Sortie de `zpool status -P -p` (anglais forcé), ou None si la commande échoue."""
+    res = subprocess.run(
+        ["zpool", "status", "-P", "-p", "--", pool_name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=_CLI_ENV,
+    )
+    if res.returncode != 0:
+        logger.error(f"zpool status {pool_name} failed: {res.stderr.strip()}")
+        return None
+    return res.stdout
 
-            parts = stripped.split()
-            if not parts:
-                continue
-            raw_name = parts[0]
-            status = parts[1] if len(parts) > 1 else "ONLINE"
-            read_err = parts[2] if len(parts) > 2 else "0"
-            write_err = parts[3] if len(parts) > 3 else "0"
-            cksum_err = parts[4] if len(parts) > 4 else "0"
 
-            # Skip the pool name line itself
-            if raw_name == pool_name and not pool_line_seen:
-                pool_line_seen = True
-                vdev_stack = []
-                continue
-
-            indent = len(line) - len(line.lstrip())
-
-            # Determine if this is a vdev (mirror/raidz/etc.) or a leaf disk
-            is_vdev_type = any(raw_name.startswith(prefix) for prefix in
-                              ["mirror", "raidz", "draid", "replacing", "spare"])
-
-            # Resolve the device path: -P gives full paths, use for matching
-            # Display name comes from basename so the UI shows the user's chosen identifier
-            if not is_vdev_type:
-                if raw_name.startswith("/dev/"):
-                    disk_path = raw_name
-                else:
-                    # Try known symlink directories to reconstruct the full path
-                    disk_path = None
-                    for prefix in ("/dev/disk/by-path/", "/dev/disk/by-vdev/", "/dev/disk/by-id/", "/dev/"):
-                        candidate = prefix + raw_name
-                        if os.path.exists(candidate):
-                            disk_path = candidate
-                            break
-                    if not disk_path:
-                        disk_path = f"/dev/{raw_name}"
-                # Display name = basename of whatever zpool reports (preserves user's chosen identifier)
-                name = os.path.basename(raw_name)
-            else:
-                disk_path = None
-                name = raw_name
-
-            # Parse error stats for leaf disks
-            disk_stats = {}
-            if not is_vdev_type:
-                try:
-                    disk_stats = {
-                        "read_errors": int(read_err) if read_err.isdigit() else 0,
-                        "write_errors": int(write_err) if write_err.isdigit() else 0,
-                        "checksum_errors": int(cksum_err) if cksum_err.isdigit() else 0,
-                    }
-                except (ValueError, TypeError):
-                    disk_stats = {}
-
-            vdev_entry = {
-                "name": name,
-                "type": "disk" if not is_vdev_type else raw_name.rsplit("-", 1)[0] if "-" in raw_name else raw_name,
-                "path": disk_path,
-                "status": status,
-                "guid": "",
-                "stats": disk_stats,
-                "children": [],
-            }
-
-            if is_vdev_type:
-                # This is a top-level vdev (mirror-0, raidz1-0, etc.)
-                groups[current_section].append(vdev_entry)
-                vdev_stack = [(indent, vdev_entry)]
-            else:
-                # This is a leaf disk
-                if vdev_stack:
-                    # Add as child to the most recent vdev
-                    parent_indent, parent_vdev = vdev_stack[-1]
-                    parent_vdev["children"].append(vdev_entry)
-                else:
-                    # No parent vdev — this is a stripe (single disk as vdev)
-                    groups[current_section].append(vdev_entry)
-
-        return groups
+def _parse_vdevs_from_status(pool_name, text=None):
+    """VDevs d'un pool à partir de `zpool status` (gardé pour compatibilité)."""
+    try:
+        if text is None:
+            text = _zpool_status_cli(pool_name)
+        if not text:
+            return {g: [] for g in _EMPTY_GROUPS}
+        return parse_config_vdevs(pool_name, split_status_sections(text).get("config", []))
     except Exception as e:
         logger.error(f"Failed to parse vdevs from zpool status: {e}")
-        return {"data": [], "cache": [], "dedup": [], "log": [], "spare": [], "special": []}
+        return {g: [] for g in _EMPTY_GROUPS}
+
+
+def pool_status_cli(pool_name, health):
+    """status_code, status_detail, error_count, scan et groupes d'un pool, en un seul `zpool status`."""
+    text = _zpool_status_cli(pool_name)
+    if text is None:
+        return {
+            "status_code": "UNKNOWN", "status_detail": "zpool status a échoué (voir le journal getpools.log)",
+            "error_count": 0, "scan": _empty_scan(), "groups": {g: [] for g in _EMPTY_GROUPS},
+        }
+    sections = split_status_sections(text)
+    code, detail = status_code_from_sections(sections, health)
+    return {
+        "status_code": code,
+        "status_detail": detail,
+        "error_count": error_count_from_sections(sections),
+        "scan": parse_scan(sections.get("scan", [])),
+        "groups": _parse_vdevs_from_status(pool_name, text),
+    }
 
 
 def _parse_bool_cli(val, default=False):
@@ -205,8 +361,8 @@ def _parse_int_cli(val, default=0):
 def _pool_extra_props_cli(pool_name):
     out = {}
     res = subprocess.run(
-        ["zpool", "get", "-Hp", "autoexpand,autoreplace,autotrim,delegation,listsnapshots,readonly,failmode,altroot,ashift,comment", pool_name],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        ["zpool", "get", "-Hp", "autoexpand,autoreplace,autotrim,delegation,listsnapshots,readonly,failmode,altroot,ashift,comment", "--", pool_name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=_CLI_ENV
     )
     if res.returncode == 0:
         for line in res.stdout.splitlines():
@@ -218,8 +374,8 @@ def _pool_extra_props_cli(pool_name):
 
 def _pool_root_dataset_cli(pool_name):
     res = subprocess.run(
-        ["zfs", "get", "-Hp", "recordsize,compression,dedup,refreservation,available,used", pool_name],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+        ["zfs", "get", "-Hp", "recordsize,compression,dedup,refreservation,available,used", "--", pool_name],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=_CLI_ENV
     )
     if res.returncode != 0:
         return None
@@ -257,7 +413,7 @@ def _pools_from_zpool_list_min():
         # -H (scripted) -p (parsable numbers) -o selected fields
         res = subprocess.run(
             ["zpool", "list", "-Hpo", "name,size,allocated,capacity,free,health,guid"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=_CLI_ENV
         )
         if res.returncode != 0:
             logger.error(f"zpool list failed: {res.stderr.strip()}")
@@ -267,17 +423,18 @@ def _pools_from_zpool_list_min():
         for line in res.stdout.strip().splitlines():
             if not line:
                 continue
-            name, size, alloc, cap, free, health, guid = line.split()
+            name, size, alloc, cap, free, health, guid = line.split("\t")
             extra = _pool_extra_props_cli(name)
             pools.append({
                 "name": name,
                 "status": health,
                 "guid": guid,
                 "properties": {
-                    "size": {"parsed": int(size)},
-                    "allocated": {"parsed": int(alloc)},
-                    "capacity": {"rawvalue": int(cap.rstrip("%"))},
-                    "free": {"parsed": int(free)},
+                    # un pool FAULTED/UNAVAIL affiche « - » : ne pas faire échouer tout le repli
+                    "size": {"parsed": _parse_int_cli(size)},
+                    "allocated": {"parsed": _parse_int_cli(alloc)},
+                    "capacity": {"rawvalue": _parse_int_cli(cap.rstrip("%"))},
+                    "free": {"parsed": _parse_int_cli(free)},
                     "health": {"parsed": health},
                     "autoexpand": {"parsed": _parse_bool_cli(extra.get("autoexpand"), False)},
                     "autoreplace": {"parsed": _parse_bool_cli(extra.get("autoreplace"), False)},
@@ -291,16 +448,7 @@ def _pools_from_zpool_list_min():
                     "comment": {"value": extra.get("comment", "-")},
                 },
                 "root_dataset": _pool_root_dataset_cli(name),
-                "scan": {
-                    "function": None, "start_time": None, "end_time": None, "pause": None,
-                    "state": None, "errors": 0, "percentage": 0,
-                    "total_secs_left": 0, "bytes_issued": 0,
-                    "bytes_processed": 0, "bytes_to_process": 0,
-                },
-                "groups": _parse_vdevs_from_status(name),
-                "status_code": "OK",
-                "status_detail": "",
-                "error_count": 0,
+                **pool_status_cli(name, health),
             })
         logger.info(f"Pools (fallback) discovered: {len(pools)}")
         return pools

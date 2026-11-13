@@ -1415,5 +1415,182 @@ class ImportablePoolsFallbackTest(unittest.TestCase):
         self.assertEqual(self.run_script("get-importable-pools.py"), [])
 
 
+ZPOOL_STATUS_DEGRADED = (
+    "  pool: H1\n"
+    " state: DEGRADED\n"
+    "status: One or more devices could not be used because the label is missing or\n"
+    "\tinvalid.  Sufficient replicas exist for the pool to continue\n"
+    "\tfunctioning in a degraded state.\n"
+    "action: Replace the device using 'zpool replace'.\n"
+    "   see: https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-4J\n"
+    "  scan: resilver in progress since Sun Nov  8 00:24:02 2026\n"
+    "\t1352331264 / 2705326080 scanned at 500M/s, 1000000000 / 2705326080 issued at 400M/s\n"
+    "\t123456789 resilvered, 36.96% done, 01:02:03 to go\n"
+    "config:\n"
+    "\n"
+    "\tNAME                                  STATE     READ WRITE CKSUM\n"
+    "\tH1                                    DEGRADED     0     0     0\n"
+    "\t  raidz1-0                            DEGRADED     0     0     0\n"
+    "\t    /dev/disk/by-id/ata-A-part1       ONLINE       0     0     0\n"
+    "\t    replacing-1                       DEGRADED     0     0     0\n"
+    "\t      /dev/disk/by-id/ata-B-part1     UNAVAIL      0     0     0  was /dev/sdb1\n"
+    "\t      /dev/disk/by-id/ata-N-part1     ONLINE       0     0     3  (resilvering)\n"
+    "\t    /dev/disk/by-id/ata-C-part1       ONLINE       2     0     0\n"
+    "\tlogs\n"
+    "\t  mirror-1                            ONLINE       0     0     0\n"
+    "\t    /dev/nvme0n1p1                    ONLINE       0     0     0\n"
+    "\t    /dev/nvme1n1p1                    ONLINE       0     0     0\n"
+    "\tcache\n"
+    "\t  /dev/nvme0n1p2                      ONLINE       0     0     0\n"
+    "\tspares\n"
+    "\t  /dev/disk/by-id/ata-S-part1         AVAIL\n"
+    "\n"
+    "errors: 12 data errors, use '-v' for a list\n"
+)
+
+ZPOOL_STATUS_OK = (
+    "  pool: tank\n"
+    " state: ONLINE\n"
+    "  scan: scrub repaired 0B in 00:10:05 with 0 errors on Sun Nov  8 00:34:07 2026\n"
+    "config:\n"
+    "\n"
+    "\tNAME        STATE     READ WRITE CKSUM\n"
+    "\ttank        ONLINE       0     0     0\n"
+    "\t  /dev/sdz  ONLINE       0     0     0\n"
+    "\n"
+    "errors: No known data errors\n"
+)
+
+
+class PoolsFallbackTest(unittest.TestCase):
+    """Repli CLI de get-pools.py / get-scan-stats.py sans python3-libzfs (chemin normal sur Debian 13)."""
+
+    SCRIPTS = os.path.join(HERE, "..", "src", "scripts")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "zpool"), "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os, sys
+                args = sys.argv[1:]
+                d = os.environ["FAKE_ZPOOL_DIR"]
+                with open(os.path.join(d, "zpool.log"), "a") as log:
+                    log.write(" ".join(args) + " LC_ALL=" + os.environ.get("LC_ALL", "") + "\\n")
+                if args[0] == "list":
+                    print("H1\\t4000000000000\\t1000000000000\\t25\\t3000000000000\\tDEGRADED\\t111")
+                    print("tank\\t-\\t-\\t-\\t-\\tONLINE\\t222")
+                elif args[0] == "get":
+                    print("%s\\tashift\\t12\\tlocal" % args[-1])
+                elif args[0] == "status":
+                    name = args[-1] if args[-1] in ("H1", "tank") else None
+                    files = [name] if name else ["H1", "tank"]
+                    sys.stdout.write("\\n".join(open(os.path.join(d, f + ".txt")).read() for f in files))
+                else:
+                    sys.exit(2)
+            """))
+        with open(os.path.join(self.bin, "zfs"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        for b in ("zpool", "zfs"):
+            os.chmod(os.path.join(self.bin, b), 0o755)
+        self.pylib = os.path.join(self.tmp, "pylib")
+        os.makedirs(self.pylib)
+        with open(os.path.join(self.pylib, "libzfs.py"), "w") as f:
+            f.write("raise ImportError('libzfs absent (test)')\n")
+        for n, t in (("H1.txt", ZPOOL_STATUS_DEGRADED), ("tank.txt", ZPOOL_STATUS_OK)):
+            with open(os.path.join(self.tmp, n), "w") as f:
+                f.write(t)
+        self.env = dict(os.environ, PATH=self.bin + ":" + os.environ["PATH"], PYTHONPATH=self.pylib,
+                        FAKE_ZPOOL_DIR=self.tmp, XDG_STATE_HOME=self.tmp, HOME=self.tmp, TZ="UTC")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_script(self, name):
+        with open(os.path.join(self.SCRIPTS, name)) as f:
+            src = f.read()
+        r = subprocess.run([sys.executable, "-c", src], env=self.env, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, check=True)
+        return json.loads(r.stdout)
+
+    def test_pool_degrade_signale(self):
+        pools = {p["name"]: p for p in self.run_script("get-pools.py")}
+        h1 = pools["H1"]
+        self.assertEqual(h1["status_code"], "CORRUPT_LABEL_R")
+        self.assertIn("label is missing", h1["status_detail"])
+        self.assertEqual(h1["error_count"], 12)
+        sc = h1["scan"]
+        self.assertEqual((sc["function"], sc["state"], sc["pause"]), ("RESILVER", "SCANNING", "None"))
+        self.assertAlmostEqual(sc["percentage"], 36.96)
+        self.assertEqual(sc["total_secs_left"], 3723)
+        self.assertEqual(sc["bytes_processed"], 1352331264)
+        self.assertEqual(sc["bytes_to_process"], 2705326080)
+        self.assertEqual(sc["bytes_issued"], 1000000000)
+        self.assertEqual(sc["start_time"], "2026-11-08 00:24:02+00:00")
+        g = h1["groups"]
+        rz = g["data"][0]
+        self.assertEqual((rz["name"], rz["type"]), ("raidz1-0", "raidz"))
+        self.assertEqual([c["name"] for c in rz["children"]], ["ata-A-part1", "replacing-1", "ata-C-part1"])
+        rep = rz["children"][1]
+        self.assertEqual([c["status"] for c in rep["children"]], ["UNAVAIL", "ONLINE"])
+        self.assertEqual(rep["children"][1]["stats"]["checksum_errors"], 3)
+        self.assertEqual(rz["children"][2]["stats"]["read_errors"], 2)
+        self.assertEqual(rz["children"][0]["path"], "/dev/disk/by-id/ata-A-part1")
+        self.assertEqual([c["name"] for c in g["log"][0]["children"]], ["nvme0n1p1", "nvme1n1p1"])
+        self.assertEqual(g["cache"][0]["name"], "nvme0n1p2")
+        self.assertEqual((g["spare"][0]["name"], g["spare"][0]["status"]), ("ata-S-part1", "AVAIL"))
+        self.assertEqual(len(g["data"]), 1)
+
+    def test_pool_sain_et_scrub_termine(self):
+        pools = {p["name"]: p for p in self.run_script("get-pools.py")}
+        tank = pools["tank"]
+        self.assertEqual((tank["status_code"], tank["status_detail"], tank["error_count"]), ("OK", "", 0))
+        sc = tank["scan"]
+        self.assertEqual((sc["function"], sc["state"], sc["errors"]), ("SCRUB", "FINISHED", 0))
+        self.assertEqual(sc["end_time"], "2026-11-08 00:34:07+00:00")
+        self.assertEqual(sc["start_time"], "2026-11-08 00:24:02+00:00")
+        # « - » de zpool list (pool sans taille lisible) ne fait plus échouer le repli
+        self.assertEqual(tank["properties"]["size"]["parsed"], 0)
+        with open(os.path.join(self.tmp, "zpool.log")) as f:
+            log = f.read()
+        self.assertIn("status -P -p -- tank LC_ALL=C", log)
+
+    def test_scan_stats_repli(self):
+        scans = self.run_script("get-scan-stats.py")
+        self.assertEqual(scans["H1"]["function"], "RESILVER")
+        self.assertAlmostEqual(scans["H1"]["percentage"], 36.96)
+        self.assertEqual(scans["H1"]["bytes_issued"], 1000000000)
+        self.assertEqual(scans["tank"]["state"], "FINISHED")
+        self.assertEqual(scans["tank"]["name"], "tank")
+
+    def test_scan_variantes(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("getpools_mod", os.path.join(self.SCRIPTS, "get-pools.py"))
+        old = dict(os.environ)
+        os.environ.update(XDG_STATE_HOME=self.tmp, HOME=self.tmp)
+        try:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            os.environ.clear(); os.environ.update(old)
+        ps = mod.parse_scan
+        self.assertIsNone(ps(["none requested"])["state"])
+        c = ps(["scrub canceled on Sun Nov  8 00:30:00 2026"])
+        self.assertEqual((c["function"], c["state"]), ("SCRUB", "CANCELED"))
+        pz = ps(["scrub paused since Sun Nov  8 01:00:00 2026", "scrub started on Sun Nov  8 00:24:02 2026",
+                 "1.23T / 2.00T scanned, 1.00T / 2.00T issued, 0B repaired, 50.00% done"])
+        self.assertEqual(pz["state"], "SCANNING")
+        self.assertNotEqual(pz["pause"], "None")
+        self.assertEqual(pz["bytes_to_process"], 2 * (1 << 40))
+        self.assertEqual(pz["percentage"], 50.0)
+        r = ps(["resilvered 1.20G in 1 days 00:00:05 with 3 errors on Sun Nov  8 00:34:07 2026"])
+        self.assertEqual((r["function"], r["state"], r["errors"]), ("RESILVER", "FINISHED", 3))
+        sec = mod.split_status_sections(ZPOOL_STATUS_OK)
+        self.assertEqual(mod.status_code_from_sections(sec, "DEGRADED"), ("DEGRADED", "Pool DEGRADED"))
+        self.assertEqual(mod.status_code_from_sections({"status": ["One or more devices are faulted in response to persistent errors."]}, "DEGRADED")[0], "FAULTED_DEV_NR")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,15 +44,16 @@
         ],
         "debian": [
             "cockpit",
+            "zfsutils-linux",
             "python3",
             "acl",
-            "python3-libzfs",
+            "attr",
+            "nfs4-acl-tools",
             "python3-pip",
             "sqlite3",
             "jq",
             "msmtp",
-            "python3-dateutil",
-            "cockpit-alerts"
+            "python3-dateutil"
         ],
         "debian_common": [
             "cockpit-ws",
@@ -60,15 +61,16 @@
             "cockpit-system",
             "cockpit-storaged",
             "cockpit-packagekit",
+            "zfsutils-linux",
             "python3",
             "acl",
-            "python3-libzfs",
+            "attr",
+            "nfs4-acl-tools",
             "python3-pip",
             "sqlite3",
             "jq",
             "msmtp",
-            "python3-dateutil",
-            "cockpit-alerts"
+            "python3-dateutil"
         ]
     },
     "builds": [

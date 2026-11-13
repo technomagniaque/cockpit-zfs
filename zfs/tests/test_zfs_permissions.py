@@ -899,7 +899,7 @@ FAKE_ZFS_NFS = textwrap.dedent(r"""
 """).lstrip()
 
 
-@unittest.skipUnless(os.geteuid() == 0 and shutil.which("setfacl"), "root + paquet acl requis")
+@unittest.skipUnless(shutil.which("setfacl"), "paquet acl requis")
 class NfsDatasetsTest(unittest.TestCase):
     """Sous-onglet NFS : NFSv3 + NFSv4.1 sur tous les datasets, exports, sharenfs."""
 
@@ -1182,6 +1182,65 @@ class NfsDatasetsTest(unittest.TestCase):
         self.assertEqual(e[0]["clients"][1], {"host": "host2", "options": ["ro"]})
         self.assertEqual(e[1]["clients"][0]["host"], "*")
         self.assertTrue(e[1]["notes"])
+
+    def test_scripts_fallback_sans_libzfs(self):
+        """Debian 13 Trixie : get-datasets.py et get-snapshots.py fonctionnent sans python3-libzfs."""
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "src", "scripts")
+        fake_zfs = os.path.join(self.bin, "zfs")
+        with open(fake_zfs, "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import sys
+                args = sys.argv[1:]
+                if args[:2] == ["list", "-Hpo"] and "-t" in args:
+                    t = args[args.index("-t") + 1]
+                    cols = args[2].split(",")
+                    if t == "filesystem,volume":
+                        if cols == ["name"]:
+                            print("tank\\ntank/partage")
+                        else:
+                            r1 = {
+                                "name": "tank", "type": "filesystem", "guid": "1001", "creation": "1700000000",
+                                "atime": "off", "casesensitivity": "sensitive", "compression": "lz4",
+                                "dedup": "off", "dnodesize": "auto", "encryption": "off", "encryptionroot": "-",
+                                "keystatus": "-", "logbias": "latency", "mlslabel": "none", "mountpoint": "/tank",
+                                "mounted": "yes", "quota": "0", "readonly": "off", "recordsize": "131072",
+                                "refquota": "0", "available": "10737418240", "used": "1048576",
+                                "usedbychildren": "524288", "usedbydataset": "524288", "usedbyrefreservation": "0",
+                                "usedbysnapshots": "0", "volblocksize": "-", "volsize": "-", "sync": "standard",
+                                "xattr": "sa", "acltype": "posixacl",
+                            }
+                            r2 = dict(r1, name="tank/partage", guid="1002", mountpoint="/tank/partage")
+                            print("\\t".join(r1[c] for c in cols))
+                            print("\\t".join(r2[c] for c in cols))
+                    elif t == "snapshot":
+                        row = {
+                            "name": "tank/partage@snap1", "guid": "9001", "creation": "1700000100",
+                            "referenced": "524288", "used": "0", "clones": "-",
+                        }
+                        print("\\t".join(row[c] for c in cols))
+                elif args[:2] == ["get", "-Hpo"]:
+                    print("tank\\t-\\ntank/partage\\t-")
+            """))
+        os.chmod(fake_zfs, 0o755)
+        r_ds = subprocess.run(
+            [sys.executable, os.path.join(scripts_dir, "get-datasets.py")],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True,
+        )
+        ds = json.loads(r_ds.stdout)
+        self.assertEqual(len(ds), 1)
+        self.assertEqual(ds[0]["name"], "tank")
+        self.assertEqual(ds[0]["children"][0]["name"], "tank/partage")
+        self.assertEqual(ds[0]["children"][0]["properties"]["acltype"]["value"], "posixacl")
+
+        r_sn = subprocess.run(
+            [sys.executable, os.path.join(scripts_dir, "get-snapshots.py"), "all"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True,
+        )
+        sn = json.loads(r_sn.stdout)
+        self.assertIn("tank/partage", sn)
+        self.assertEqual(sn["tank/partage"][0]["snapshot_name"], "snap1")
+        self.assertEqual(sn["tank/partage"][0]["id"], "9001")
 
 
 if __name__ == "__main__":

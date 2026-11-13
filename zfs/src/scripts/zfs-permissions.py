@@ -616,7 +616,7 @@ def idmap_info():
                 if not line or line[0] in "#;":
                     continue
                 # conffile.c (nfs-utils) : la valeur s'arrête au premier « # » ou « ; », même sans espace
-                line = re.split(r"[#;]", line, 1)[0].strip()
+                line = re.split(r"[#;]", line, maxsplit=1)[0].strip()
                 if line.startswith("["):
                     section = line.strip("[]").strip().lower()
                 elif "=" in line:

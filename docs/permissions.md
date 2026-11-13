@@ -67,7 +67,7 @@ symboliques ne sont jamais suivis, `.zfs` est ignoré à la racine de chaque dat
 OpenZFS upstream sous Linux n'a **pas** d'ACL NFSv4 natives : `acltype=nfsv4` y est accepté
 mais **équivaut à `acltype=off`** (zfsprops(7)) et désactive donc les ACL ; les vraies ACL NFSv4
 n'existent que sur FreeBSD et sur les piles patchées (TrueNAS ; PR openzfs/zfs#16967 non fusionnée). Un
-partage NFSv4.1 depuis Oracle Linux / UEK repose donc sur les ACL POSIX, que le serveur NFS
+partage NFSv4.1 depuis Debian 13 (Trixie, noyau 6.12 LTS) repose donc sur les ACL POSIX, que le serveur NFS
 du noyau traduit (`fs/nfsd/nfs4acl.c`). Le module reproduit cette traduction à l'identique :
 
 - **POSIX → NFSv4** (`_posix_to_nfsv4_one`, `nfsd4_get_nfs4_acl`) : ordre OWNER@, nommés,
@@ -137,7 +137,7 @@ Ce que montre le code :
   échoue. En NFSv4.1, knfsd n'a pas ce plafond : la limite est la taille encodée de l'attribut
   ACL côté client (environ 64 Kio). Sans ACL POSIX, GETACL renvoie
   l'ACL minimale du mode et SETACL échoue (`set_posix_acl` → EOPNOTSUPP). Vue « NFSv3 (nfsacl) »
-  à côté de la vue NFSv4.1 dans « État & ACL ». Identique en 6.12 (UEK8) et en version actuelle.
+  à côté de la vue NFSv4.1 dans « État & ACL ». Identique en 6.12 LTS (Debian 13 Trixie) et en version actuelle.
 - **Points de montage** (`nfsd_cross_mnt`, identique en 6.12) : un client NFSv4 traverse vers
   un dataset enfant **exporté** ; un client NFSv3 ne le fait que si le parent a `crossmnt` ou
   l'enfant `nohide`. Un enfant **non exporté** apparaît comme le dossier vide du point de
@@ -192,10 +192,18 @@ sharenfs depuis le panneau d'édition (simulation obligatoire, confirmation dés
 paramètre change, `zfs set` / `zfs inherit` avec valeur en liste blanche). Ne gérez pas un même
 chemin à la fois par sharenfs et par cockpit-file-sharing / `/etc/exports`.
 
-## Dépendances
+## Dépendances (Debian 13 Trixie)
 
-Aucune pour le backend (bibliothèque standard Python). Le paquet `acl` reste dans le manifeste
-pour les outils `getfacl` / `setfacl` en ligne de commande.
+Le backend `zfs-permissions.py` utilise uniquement la bibliothèque standard Python 3 (Python 3.13 sur Debian 13).
+Les scripts de découverte (`get-pools.py`, `get-datasets.py`, `get-snapshots.py`, `get-scan-stats.py`,
+`get-disk-stats.py`) basculent automatiquement sur les commandes CLI `zpool` / `zfs` (`zfsutils-linux`)
+lorsque `python3-libzfs` n'est pas installé (paquet absent des dépôts officiels Debian 13 Trixie).
+
+Paquets Debian 13 recommandés :
+
+```bash
+apt install zfsutils-linux acl attr nfs4-acl-tools nfs-kernel-server nfs-common
+```
 
 ## Tests
 

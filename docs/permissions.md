@@ -196,8 +196,17 @@ chemin à la fois par sharenfs et par cockpit-file-sharing / `/etc/exports`.
 
 Le backend `zfs-permissions.py` utilise uniquement la bibliothèque standard Python 3 (Python 3.13 sur Debian 13).
 Les scripts de découverte (`get-pools.py`, `get-datasets.py`, `get-snapshots.py`, `get-scan-stats.py`,
-`get-disk-stats.py`) basculent automatiquement sur les commandes CLI `zpool` / `zfs` (`zfsutils-linux`)
-lorsque `python3-libzfs` n'est pas installé (paquet absent des dépôts officiels Debian 13 Trixie).
+`get-disk-stats.py`, `get-importable-pools.py`, `get-importable-destroyed-pools.py`) basculent automatiquement
+sur les commandes CLI `zpool` / `zfs` (`zfsutils-linux`) lorsque `python3-libzfs` n'est pas installé (paquet
+absent des dépôts officiels Debian 13 Trixie).
+
+Limites connues du repli CLI :
+
+- `get-datasets.py` : liste plate de tous les systèmes de fichiers et volumes (enfants directs dans `children`),
+  `value` lisible (`zfs list -Ho`), `rawvalue` brute (`-Hpo`), `parsed` typée — même forme que libzfs.
+- Import de pools (`zpool import` / `zpool import -D`, analysés avec `LC_ALL=C`) : `zpool import` n'affiche ni
+  les GUID des vdevs ni leurs compteurs d'erreurs ; ces champs restent vides / à zéro. Le GUID du pool, son
+  état, sa topologie (data, log, cache, spare, special, dedup) et l'état de chaque vdev sont fidèles.
 
 Paquets Debian 13 recommandés :
 

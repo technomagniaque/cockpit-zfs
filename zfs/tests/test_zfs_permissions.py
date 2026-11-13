@@ -1268,6 +1268,152 @@ class NfsDatasetsTest(unittest.TestCase):
         self.assertEqual(sn["tank/partage"][0]["snapshot_name"], "snap1")
         self.assertEqual(sn["tank/partage"][0]["id"], "9001")
 
+ZPOOL_IMPORT_FIXTURE = (
+    "   pool: H1\n"
+    "     id: 15137479089373342446\n"
+    "  state: DEGRADED\n"
+    " status: One or more devices are missing from the system.\n"
+    " action: The pool can be imported despite missing or damaged devices.  The\n"
+    "\tfault tolerance of the pool may be compromised if imported.\n"
+    "   see: https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-2Q\n"
+    " config:\n"
+    "\n"
+    "\tH1                        DEGRADED\n"
+    "\t  raidz1-0                DEGRADED\n"
+    "\t    ata-ST4000_A          ONLINE\n"
+    "\t    ata-ST4000_B          ONLINE\n"
+    "\t    ata-ST4000_C          ONLINE\n"
+    "\t    1234567890123456789   UNAVAIL\n"
+    "\tlogs\n"
+    "\t  mirror-1                ONLINE\n"
+    "\t    nvme-A-part1          ONLINE\n"
+    "\t    nvme-B-part1          ONLINE\n"
+    "\tcache\n"
+    "\t  nvme-C-part2\n"
+    "\tspares\n"
+    "\t  ata-ST4000_S\n"
+    "\n"
+    "   pool: vieux\n"
+    "     id: 42\n"
+    "  state: ONLINE\n"
+    " action: The pool can be imported using its name or numeric identifier.\n"
+    " config:\n"
+    "\n"
+    "\tvieux       ONLINE\n"
+    "\t  sdz       ONLINE\n"
+)
+
+ZPOOL_IMPORT_D_FIXTURE = (
+    "   pool: detruit\n"
+    "     id: 777\n"
+    "  state: ONLINE (DESTROYED)\n"
+    " action: The pool can be imported using its name or numeric identifier.\n"
+    " config:\n"
+    "\n"
+    "\tdetruit     ONLINE\n"
+    "\t  mirror-0  ONLINE\n"
+    "\t    sdx     ONLINE\n"
+    "\t    sdy     ONLINE\n"
+)
+
+
+class ImportablePoolsFallbackTest(unittest.TestCase):
+    """Repli CLI `zpool import` des scripts d'import quand python3-libzfs est absent."""
+
+    SCRIPTS = os.path.join(HERE, "..", "src", "scripts")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        fake = os.path.join(self.bin, "zpool")
+        with open(fake, "w") as f:
+            f.write(textwrap.dedent("""\
+                #!/usr/bin/env python3
+                import os, sys
+                args = sys.argv[1:]
+                with open(os.environ["FAKE_ZPOOL_LOG"], "a") as log:
+                    log.write(" ".join(args) + "\\n")
+                if args[:1] != ["import"]:
+                    sys.exit(2)
+                name = "import_d.txt" if "-D" in args else "import.txt"
+                path = os.path.join(os.environ["FAKE_ZPOOL_DIR"], name)
+                text = open(path).read()
+                if not text:
+                    sys.stderr.write("no pools available to import\\n")
+                    sys.exit(1)
+                sys.stdout.write(text)
+            """))
+        os.chmod(fake, 0o755)
+        # libzfs volontairement introuvable : un module « libzfs » qui lève ImportError
+        self.pylib = os.path.join(self.tmp, "pylib")
+        os.makedirs(self.pylib)
+        with open(os.path.join(self.pylib, "libzfs.py"), "w") as f:
+            f.write("raise ImportError('libzfs absent (test)')\n")
+        self.log = os.path.join(self.tmp, "zpool.log")
+        self.env = dict(os.environ, PATH=self.bin + ":" + os.environ["PATH"], PYTHONPATH=self.pylib,
+                        FAKE_ZPOOL_DIR=self.tmp, FAKE_ZPOOL_LOG=self.log, XDG_STATE_HOME=self.tmp)
+        self.write("import.txt", ZPOOL_IMPORT_FIXTURE)
+        self.write("import_d.txt", ZPOOL_IMPORT_D_FIXTURE)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, name, text):
+        with open(os.path.join(self.tmp, name), "w") as f:
+            f.write(text)
+
+    def run_script(self, name):
+        # comme le front : python3 -c "<source>"
+        with open(os.path.join(self.SCRIPTS, name)) as f:
+            src = f.read()
+        r = subprocess.run([sys.executable, "-c", src], env=self.env, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, check=True)
+        return json.loads(r.stdout)
+
+    def test_importable_pools(self):
+        pools = self.run_script("get-importable-pools.py")
+        self.assertEqual([p["name"] for p in pools], ["H1", "vieux"])
+        h1 = pools[0]
+        self.assertEqual(h1["guid"], "15137479089373342446")
+        self.assertEqual(h1["status"], "DEGRADED")
+        self.assertEqual(h1["properties"]["health"]["value"], "DEGRADED")
+        self.assertIn("missing", h1["status_detail"])
+        for g in ("data", "cache", "dedup", "log", "spare", "special"):
+            self.assertIsInstance(h1["groups"][g], list)
+        rz = h1["groups"]["data"][0]
+        self.assertEqual((rz["name"], rz["type"], rz["status"]), ("raidz1-0", "raidz", "DEGRADED"))
+        self.assertEqual([c["name"] for c in rz["children"]],
+                         ["ata-ST4000_A", "ata-ST4000_B", "ata-ST4000_C", "1234567890123456789"])
+        self.assertEqual(rz["children"][3]["status"], "UNAVAIL")
+        self.assertEqual(rz["children"][0]["type"], "disk")
+        log = h1["groups"]["log"][0]
+        self.assertEqual((log["type"], len(log["children"])), ("mirror", 2))
+        self.assertEqual(h1["groups"]["cache"][0]["name"], "nvme-C-part2")
+        self.assertEqual(h1["groups"]["spare"][0]["name"], "ata-ST4000_S")
+        self.assertEqual(h1["scan"]["start_time"], "None")
+        self.assertIn("read_errors", rz["stats"])
+        vieux = pools[1]
+        self.assertEqual(vieux["groups"]["data"][0]["name"], "sdz")
+        self.assertEqual(vieux["groups"]["data"][0]["children"], [])
+        with open(self.log) as f:
+            self.assertEqual(f.read().split("\n")[0], "import")
+
+    def test_destroyed_pools(self):
+        pools = self.run_script("get-importable-destroyed-pools.py")
+        self.assertEqual([p["name"] for p in pools], ["detruit"])
+        self.assertEqual(pools[0]["status"], "ONLINE")
+        self.assertTrue(pools[0]["destroyed"])
+        self.assertEqual([c["name"] for c in pools[0]["groups"]["data"][0]["children"]], ["sdx", "sdy"])
+        with open(self.log) as f:
+            args = f.read().split()
+        self.assertEqual(args[:2], ["import", "-D"])
+        self.assertIn("-d", args)
+
+    def test_aucun_pool(self):
+        self.write("import.txt", "")
+        self.assertEqual(self.run_script("get-importable-pools.py"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

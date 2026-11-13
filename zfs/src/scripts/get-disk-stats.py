@@ -1,15 +1,27 @@
 import json
-import subprocess
+import os
 import re
+import subprocess
+import sys
+
+
+def _count(text):
+    """Compteur READ/WRITE/CKSUM : entier (zpool status -p) ; « 1.2K » sans -p ne doit pas devenir 0."""
+    m = re.match(r"^(\d+(?:\.\d+)?)([KMGTPE]?)$", text or "")
+    if not m:
+        return 0
+    return int(float(m.group(1)) * {"": 1, "K": 1000, "M": 10**6, "G": 10**9, "T": 10**12, "P": 10**15, "E": 10**18}[m.group(2)])
 
 def _disk_stats_from_zpool_status():
     """Fallback: parse per-disk info from 'zpool status' when libzfs is unavailable."""
     try:
         res = subprocess.run(
-            ["zpool", "status"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+            ["zpool", "status", "-p"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            env=dict(os.environ, LC_ALL="C", LANG="C"),
         )
         if res.returncode != 0:
+            print(f"get-disk-stats: zpool status a échoué : {res.stderr.strip()}", file=sys.stderr)
             return {}
 
         z_pools = {}
@@ -52,7 +64,8 @@ def _disk_stats_from_zpool_status():
                 continue
 
             # Skip known section keywords and vdev types
-            if name in ("cache", "log", "dedup", "spare", "special"):
+            # « logs » et « spares » sont les en-têtes réels de zpool status (ils devenaient des disques)
+            if len(parts) == 1 and name in ("cache", "log", "logs", "dedup", "spare", "spares", "special"):
                 continue
 
             is_vdev = any(name.startswith(p) for p in
@@ -68,16 +81,17 @@ def _disk_stats_from_zpool_status():
             z_pools[current_pool].append({
                 "name": name,
                 "stats": {
-                    "read_errors": int(read_err) if read_err.isdigit() else 0,
-                    "write_errors": int(write_err) if write_err.isdigit() else 0,
-                    "checksum_errors": int(cksum_err) if cksum_err.isdigit() else 0,
+                    "read_errors": _count(read_err),
+                    "write_errors": _count(write_err),
+                    "checksum_errors": _count(cksum_err),
                 },
                 "guid": "",
                 "status": status,
             })
 
         return z_pools
-    except Exception:
+    except Exception as e:
+        print(f"get-disk-stats: {e}", file=sys.stderr)
         return {}
 
 

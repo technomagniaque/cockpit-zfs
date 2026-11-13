@@ -1616,6 +1616,17 @@ class PoolsFallbackTest(unittest.TestCase):
         self.assertEqual(scans["tank"]["state"], "FINISHED")
         self.assertEqual(scans["tank"]["name"], "tank")
 
+    def test_disk_stats_repli(self):
+        disks = self.run_script("get-disk-stats.py")
+        names = [d["name"] for d in disks["H1"]]
+        for header in ("logs", "spares", "cache"):
+            self.assertNotIn(header, names)
+        by = {os.path.basename(d["name"]): d for d in disks["H1"]}
+        self.assertEqual(by["ata-C-part1"]["stats"]["read_errors"], 2)
+        self.assertEqual(by["ata-N-part1"]["stats"]["checksum_errors"], 3)
+        self.assertEqual(by["ata-S-part1"]["status"], "AVAIL")
+        self.assertEqual([os.path.basename(d["name"]) for d in disks["tank"]], ["sdz"])
+
     def test_scan_variantes(self):
         import importlib.util
         spec = importlib.util.spec_from_file_location("getpools_mod", os.path.join(self.SCRIPTS, "get-pools.py"))

@@ -489,11 +489,11 @@ class PermissionsTest(unittest.TestCase):
     def test_delegate_command(self):
         d = self.ok("delegate", dataset="tank/data", kind="group", who="root", scope="descendent",
                     perms=["snapshot", "mount"], dry_run=True)
-        self.assertEqual(d["command"], "zfs allow -d -g root snapshot,mount tank/data")
+        self.assertEqual(d["command"], "zfs allow -d -g root -- snapshot,mount tank/data")
 
     def test_preset_plan(self):
         d = self.ok("preset", dataset="tank/data", preset="posixacl-smb", dry_run=True)
-        self.assertEqual(d["commands"], ["zfs set dnodesize=auto tank/data"])
+        self.assertEqual(d["commands"], ["zfs set dnodesize=auto -- tank/data"])
 
     @staticmethod
     def _has_group(name):
@@ -772,7 +772,7 @@ class _Nfs4CommandTests:
 
     def test_preset_nfsv4(self):
         d = self.ok("preset", dataset="tank/data", preset="nfsv4-posix", dry_run=True)
-        self.assertEqual(d["commands"], ["zfs set dnodesize=auto tank/data"])
+        self.assertEqual(d["commands"], ["zfs set dnodesize=auto -- tank/data"])
         d = self.ok("preset", dataset="tank/data", preset="nfsv4", dry_run=True)
         self.assertTrue(any("acltype=off" in n for n in d["notes"]))
         d = self.call("preset", dataset="tank/data", preset="nfsv4", dry_run=False)
@@ -864,7 +864,7 @@ FAKE_ZFS_NFS = textwrap.dedent(r"""
     #!/usr/bin/env python3
     import json, os, sys
     ds = json.load(open(os.environ["FAKE_DATASETS"]))
-    args = sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a != "--"]  # le backend passe « -- » avant les noms
     with open(os.environ["FAKE_LOG"], "a") as f:
         f.write(" ".join(args) + "\n")
     def sel(name):
@@ -892,7 +892,7 @@ FAKE_ZFS_NFS = textwrap.dedent(r"""
                      "normalization": "none", "utf8only": "off"}
             for p in args[args.index("property,value,source") + 1].split(","):
                 print("%s\t%s\tdefault" % (p, props[p]))
-    elif args[0] in ("set", "inherit"):
+    elif args[0] in ("set", "inherit", "allow"):
         pass
     else:
         sys.exit(1)
@@ -1042,7 +1042,7 @@ class NfsDatasetsTest(unittest.TestCase):
     def test_edition_sharenfs(self):
         d = self.ok("nfs-sharenfs", dataset="tank/data/child", value="rw=@10.0.0.0/24,crossmnt")
         self.assertTrue(d["dry_run"])
-        self.assertEqual(d["command"], "zfs set sharenfs=rw=@10.0.0.0/24,crossmnt tank/data/child")
+        self.assertEqual(d["command"], "zfs set sharenfs=rw=@10.0.0.0/24,crossmnt -- tank/data/child")
         self.assertNotIn("set", self.readlog())
         for bad in ("rw;id", "rw\nro", "-d", "rw,bogus", "rw ro"):
             self.assertFalse(self.call("nfs-sharenfs", dataset="tank/data/child", value=bad)["ok"], bad)
@@ -1138,6 +1138,16 @@ class NfsDatasetsTest(unittest.TestCase):
         d = self.call("nfs-sharenfs", dataset="tank/data", op="inherit")
         self.assertFalse(d["ok"])
         self.assertIn(self.p("child"), d["error"])
+
+    def test_noms_de_dataset_refuses(self):
+        for cmd, params in (("delegation", {"dataset": "-o"}),
+                            ("delegate", {"dataset": "-r", "kind": "everyone", "perms": ["diff"]}),
+                            ("delegate", {"dataset": "tank/da;ta", "kind": "everyone", "perms": ["diff"]}),
+                            ("preset", {"dataset": "-x", "preset": "posixacl-smb"})):
+            d = self.call(cmd, **params)
+            self.assertFalse(d["ok"], (cmd, params))
+            self.assertIn("invalide", d["error"])
+        self.assertEqual(self.readlog(), "")
 
     def test_dataset_systeme_refuse(self):
         """M6"""

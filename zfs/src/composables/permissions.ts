@@ -333,8 +333,9 @@ export const getMethods = () =>
 
 /** Snapshots directs d'un dataset (sources pour la restauration des permissions). */
 export async function listDatasetSnapshots(dataset: string): Promise<string[]> {
+	if (!dataset || dataset.startsWith('-')) return [];
 	try {
-		const state = useSpawn(['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name', '-s', 'creation', '-d', '1', dataset], { superuser: 'try' });
+		const state = useSpawn(['zfs', 'list', '-H', '-t', 'snapshot', '-o', 'name', '-s', 'creation', '-d', '1', '--', dataset], { superuser: 'try' });
 		const out = (await state.promise()).stdout ?? '';
 		return out.split('\n').map((l: string) => l.trim()).filter(Boolean).reverse();
 	} catch (state) {

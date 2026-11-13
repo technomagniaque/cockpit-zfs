@@ -151,7 +151,9 @@ class PermError(Exception):
 # --------------------------------------------------------------------------- utilitaires
 
 def run(cmd, check=True):
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # zfs / zpool en anglais : parse_zfs_allow et les autres analyses lisent leurs libellés
+    env = dict(os.environ, LC_ALL="C", LANG="C") if cmd and cmd[0] in ("zfs", "zpool") else None
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     out = proc.stdout.decode("utf-8", "surrogateescape")
     err = proc.stderr.decode("utf-8", "replace")
     if check and proc.returncode != 0:
@@ -1138,8 +1140,16 @@ def dataset_for_path(path, filesystems=None):
     return best
 
 
+def check_dataset_name(dataset):
+    """Nom de dataset ZFS accepté (DATASET_CHARS), jamais « - » en tête : refuse toute option déguisée."""
+    if not dataset or not isinstance(dataset, str) or dataset.startswith("-") or not DATASET_CHARS.fullmatch(dataset):
+        raise PermError("Nom de dataset invalide : %r" % (dataset,))
+    return dataset
+
+
 def zfs_props(dataset):
-    _c, out, _e = run(["zfs", "get", "-H", "-p", "-o", "property,value,source", ",".join(ACL_PROPS), dataset])
+    check_dataset_name(dataset)
+    _c, out, _e = run(["zfs", "get", "-H", "-p", "-o", "property,value,source", ",".join(ACL_PROPS), "--", dataset])
     props = {}
     for line in out.splitlines():
         parts = line.split("\t")
@@ -2425,7 +2435,8 @@ def cmd_delegation(params):
     dataset = params.get("dataset")
     if not dataset:
         raise PermError("Dataset requis")
-    _c, out, _e = run(["zfs", "allow", dataset])
+    check_dataset_name(dataset)
+    _c, out, _e = run(["zfs", "allow", "--", dataset])
     return {"dataset": dataset, "entries": parse_zfs_allow(out), "known_perms": ZFS_DELEGATION_PERMS, "raw": out}
 
 
@@ -2436,8 +2447,9 @@ def cmd_delegate(params):
     who = str(params.get("who", "") or "")
     scope = params.get("scope", "both")
     perms = [p.strip() for p in params.get("perms", []) if p.strip()]
-    if not dataset or dataset.startswith("-"):
+    if not dataset:
         raise PermError("Dataset requis")
+    check_dataset_name(dataset)
     if op not in ("allow", "unallow"):
         raise PermError("Opération inconnue : %s" % op)
     if not perms and not (op == "unallow" and params.get("all")):
@@ -2471,6 +2483,7 @@ def cmd_delegate(params):
         cmd += ["-s", who]
     else:
         raise PermError("Type de délégation inconnu : %s" % kind)
+    cmd.append("--")
     if perms:
         cmd.append(",".join(perms))
     cmd.append(dataset)
@@ -2489,6 +2502,7 @@ def cmd_preset(params):
         if params.get("list"):
             return {"presets": {k: v["label"] for k, v in PRESETS.items()}}
         raise PermError("Dataset et préréglage requis")
+    check_dataset_name(dataset)
     props = zfs_props(dataset)
     changes, commands = [], []
     for k, v in preset["props"].items():
@@ -2502,7 +2516,7 @@ def cmd_preset(params):
                             "note": "définissable seulement à la création du dataset"})
             continue
         changes.append({"prop": k, "from": current, "to": v})
-        commands.append(["zfs", "set", "%s=%s" % (k, v), dataset])
+        commands.append(["zfs", "set", "%s=%s" % (k, v), "--", dataset])
     notes = []
     if params.get("preset") == "macos-smb" and props.get("normalization", {}).get("value") != "formD":
         notes.append("normalization=formD est recommandé pour macOS mais ne se fixe qu'à la création (zfs create -o normalization=formD)")
@@ -2672,7 +2686,7 @@ def _list_datasets(dataset):
     if not dataset or not DATASET_CHARS.fullmatch(dataset) or dataset.startswith("-"):
         raise PermError("Nom de dataset invalide")
     _c, out, _e = run(["zfs", "list", "-H", "-p", "-r", "-t", "filesystem", "-o",
-                       "name,mountpoint,mounted,sharenfs,acltype,xattr,guid", dataset])
+                       "name,mountpoint,mounted,sharenfs,acltype,xattr,guid", "--", dataset])
     rows = []
     for line in out.splitlines():
         parts = line.split("\t")
@@ -2682,7 +2696,7 @@ def _list_datasets(dataset):
                      "sharenfs": parts[3], "acltype": norm_prop("acltype", parts[4]), "xattr": parts[5],
                      "guid": parts[6]})
     _c, out, _e = run(["zfs", "get", "-H", "-p", "-r", "-t", "filesystem", "-o", "name,value,source",
-                       "sharenfs", dataset], check=False)
+                       "sharenfs", "--", dataset], check=False)
     src = {}
     for line in out.splitlines():
         parts = line.split("\t")
@@ -3166,7 +3180,7 @@ def _parent_sharenfs(dataset):
     if "/" not in dataset:
         return "off"
     parent = dataset.rsplit("/", 1)[0]
-    _c, out, _e = run(["zfs", "get", "-H", "-o", "value", "sharenfs", parent], check=False)
+    _c, out, _e = run(["zfs", "get", "-H", "-o", "value", "sharenfs", "--", parent], check=False)
     return out.strip() or "off"
 
 
@@ -3185,10 +3199,10 @@ def cmd_nfs_sharenfs(params):
              "sharenfs est hérité par les datasets enfants"]
     if op == "set":
         value = validate_sharenfs(params.get("value", ""))
-        cmd = ["zfs", "set", "sharenfs=%s" % value, dataset]
+        cmd = ["zfs", "set", "sharenfs=%s" % value, "--", dataset]
         new_value = value
     elif op == "inherit":
-        cmd = ["zfs", "inherit", "sharenfs", dataset]
+        cmd = ["zfs", "inherit", "sharenfs", "--", dataset]
         new_value = _parent_sharenfs(dataset)
         notes.append("Après « zfs inherit », la valeur effective sera celle du parent : %s" % new_value)
     else:

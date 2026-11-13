@@ -575,31 +575,60 @@ def nfs4_view(access, default, is_dir):
 _idmap_cache = {}
 
 
+def _dns_domain():
+    """Domaine DNS sans résolution inverse : partie du nom d'hôte après le premier point,
+    sinon nom canonique via getaddrinfo (délai court), sinon « localdomain »."""
+    import socket
+    import threading
+    host = socket.gethostname()
+    if "." in host:
+        return host.split(".", 1)[1], "domaine DNS (nom d'hôte)"
+    box = {}
+
+    def lookup():
+        try:
+            box["r"] = socket.getaddrinfo(host, None, 0, 0, 0, socket.AI_CANONNAME)
+        except OSError:
+            pass
+    t = threading.Thread(target=lookup, daemon=True)
+    t.start()
+    t.join(1.5)
+    for r in box.get("r") or []:
+        canon = r[3]
+        if canon and "." in canon:
+            return canon.split(".", 1)[1], "domaine DNS (nom canonique)"
+    return "localdomain", "défaut (aucun domaine trouvé)"
+
+
 def idmap_info():
     """Domaine NFSv4 (idmapd.conf, sinon domaine DNS) et nfs4_disable_idmapping de nfsd."""
     if "info" in _idmap_cache:
         return _idmap_cache["info"]
     domain, source = None, None
+    nobody_user, nobody_group = "nobody", "nobody"   # défauts de nfs-utils (libnfsidmap)
     try:
         section = None
         with open(os.environ.get("COCKPIT_ZFS_IDMAPD_CONF", "/etc/idmapd.conf"), errors="replace") as f:
             for line in f:
-                line = line.split("#", 1)[0].strip()
+                line = line.strip()
+                if not line or line[0] in "#;":
+                    continue
+                line = re.split(r"\s[#;]", line, 1)[0].strip()
                 if line.startswith("["):
                     section = line.strip("[]").strip().lower()
-                elif section == "general" and "=" in line:
-                    k, v = line.split("=", 1)
-                    if k.strip().lower() == "domain" and v.strip():
-                        domain, source = v.strip(), "idmapd.conf"
+                elif "=" in line:
+                    k, v = (x.strip() for x in line.split("=", 1))
+                    k = k.lower()
+                    if section == "general" and k == "domain" and v:
+                        domain, source = v, "idmapd.conf"
+                    elif section == "mapping" and k == "nobody-user" and v:
+                        nobody_user = v
+                    elif section == "mapping" and k == "nobody-group" and v:
+                        nobody_group = v
     except OSError:
         pass
     if not domain:
-        import socket
-        fqdn = socket.getfqdn()
-        if "." in fqdn:
-            domain, source = fqdn.split(".", 1)[1], "domaine DNS"
-        else:
-            domain, source = "localdomain", "défaut (aucun domaine trouvé)"
+        domain, source = _dns_domain()
     disable = None
     try:
         with open("/sys/module/nfsd/parameters/nfs4_disable_idmapping") as f:
@@ -607,7 +636,7 @@ def idmap_info():
     except OSError:
         pass
     info = {"domain": domain, "domain_source": source, "disable_idmapping": disable,
-            "nfsd_loaded": disable is not None}
+            "nfsd_loaded": disable is not None, "nobody_user": nobody_user, "nobody_group": nobody_group}
     _idmap_cache["info"] = info
     return info
 
@@ -618,9 +647,11 @@ def nfs4_principal(a, numeric=False):
     if numeric:
         return str(a["id"])
     name = gid_name(a["id"]) if a["group"] else uid_name(a["id"])
+    info = idmap_info()
     if name is None:
-        return str(a["id"])
-    return "%s@%s" % (name, idmap_info()["domain"])
+        # nfsd4_encode_name → idmap : un identifiant sans nom part comme Nobody-User / Nobody-Group
+        name = info["nobody_group"] if a["group"] else info["nobody_user"]
+    return "%s@%s" % (name, info["domain"])
 
 
 def nfs4_ace_text(a, is_dir, numeric=False):
@@ -677,6 +708,70 @@ def nfs4_view_for(access, default, is_dir, numeric=False):
         "text": nfs4_render(aces, is_dir, numeric),
         "deny_count": sum(1 for a in aces if a["type"] == NFS4_ACE_DENY),
         "notes": nfs4_explain(access, default if is_dir else [], is_dir),
+    }
+
+
+class _NoAcl(Exception):
+    """Le système de fichiers n'a pas d'ACL POSIX : pas d'attribut ACL côté NFSv4."""
+
+
+# ---- NFSv3 : protocole NFSACL (fs/nfsd/nfs3acl.c, fs/nfs_common/nfsacl.c)
+
+NFS_ACL_MAX_ENTRIES = 1024   # include/linux/nfsacl.h
+
+
+def nfsacl_wire(acl):
+    """Ce que nfsacl_encode() envoie : une ACL minimale (3 entrées) reçoit un masque
+    égal aux droits du groupe (ordre canonique user::, group::, mask::, other::)."""
+    if not acl:
+        return []
+    acl = _posix_sorted(acl)
+    if len(acl) == 3:
+        return [acl[0], acl[1], (ACL_MASK, acl[1][1], None), acl[2]]
+    return acl
+
+
+def posix_text(acl, numeric=False, prefix=""):
+    out = []
+    for tag, perm, ident in acl:
+        name, named = TAG_NAMES.get(tag, ("?", False))
+        qual = ""
+        if named:
+            n = None if numeric else (uid_name(ident) if tag == ACL_USER else gid_name(ident))
+            qual = n if n is not None else str(ident)
+        out.append("%s%s:%s:%s" % (prefix, name, qual, _rwx(perm)))
+    return out
+
+
+def nfs3_view(access, default, is_dir, posix_fs, st_mode):
+    """Vue d'un client NFSv3 (GETACL du protocole NFSACL). Les identifiants circulent en
+    numérique : le client les traduit avec ses propres comptes."""
+    notes = []
+    if not posix_fs:
+        # get_inode_acl() renvoie NULL → posix_acl_from_mode() ; SETACL : set_posix_acl → EOPNOTSUPP
+        access = base_from_mode(st_mode)
+        default = []
+        notes.append("Pas d'ACL POSIX sur ce système de fichiers : GETACL renvoie l'ACL minimale dérivée du mode, "
+                     "SETACL (setfacl côté client) échoue avec EOPNOTSUPP")
+    wa = nfsacl_wire(access)
+    wd = nfsacl_wire(default) if is_dir else []
+    over = [label for label, a in (("accès", access), ("défaut", default)) if len(a) > NFS_ACL_MAX_ENTRIES]
+    if over:
+        notes.append("ACL %s de plus de %d entrées : nfsacl_encode() renvoie EINVAL, GETACL échoue pour ce fichier"
+                     % (" et ".join(over), NFS_ACL_MAX_ENTRIES))
+    if len(access) == 3:
+        notes.append("ACL minimale : le serveur ajoute mask:: = droits du groupe ; le client Linux la ramène "
+                     "en général au simple mode")
+    notes.append("Identifiants transmis en numérique (UID / GID) : getfacl côté client affiche les noms de "
+                 "SES comptes pour ces numéros, ou les numéros s'il ne les connaît pas")
+    if not is_dir:
+        notes.append("Pas d'ACL par défaut sur un fichier")
+    return {
+        "text": posix_text(wa) + posix_text(wd, prefix="default:"),
+        "numeric_text": posix_text(wa, numeric=True) + posix_text(wd, numeric=True, prefix="default:"),
+        "entries_access": len(access), "entries_default": len(default) if is_dir else 0,
+        "limit": NFS_ACL_MAX_ENTRIES, "over_limit": bool(over), "posix_fs": posix_fs,
+        "notes": notes,
     }
 
 
@@ -751,12 +846,19 @@ def _resolve_principal(principal, is_group):
     numérique (accepté quand nfs4_disable_idmapping est actif)."""
     if principal in NFS4_SPECIAL_WHO:
         return {"OWNER@": "OWNER@", "GROUP@": "GROUP@", "EVERYONE@": "EVERYONE@"}[principal], None, None
-    if principal.isdigit():
-        return "named", int(principal), None
+    info = idmap_info()
+    if re.fullmatch(r"[0-9]{1,10}", principal):
+        ident = int(principal)
+        if ident >= 4294967295:
+            raise PermError("Identifiant %s hors limites : le client recevrait NFS4ERR_BADOWNER" % principal)
+        return "named", ident, ("principal numérique %s : knfsd ne l'accepte que si nfs4_disable_idmapping "
+                                "est actif ET en sec=sys (AUTH_SYS) ; sinon NFS4ERR_BADOWNER" % principal)
     name, _, dom = principal.partition("@")
     note = None
-    info = idmap_info()
-    if dom and dom.lower() != info["domain"].lower():
+    if not dom:
+        note = ("principal « %s » sans @domaine : nfsidmap le refusera probablement (NFS4ERR_BADOWNER) ; "
+                "écrivez %s@%s" % (principal, principal, info["domain"]))
+    elif dom.lower() != info["domain"].lower():
         note = ("domaine %s différent du domaine NFSv4 du serveur (%s) : nfsidmap le refusera "
                 "(NFS4ERR_BADOWNER)" % (dom, info["domain"]))
     try:
@@ -878,14 +980,24 @@ def _state_to_acl(state, is_dir, default=False):
     return _posix_sorted(acl)
 
 
-def nfs4_to_posix(text, is_dir, client_filter=True):
+def nfs4_to_posix(text, is_dir, client_filter=True, existing_default=None, existing_mode=None):
     """nfs4_acl_nfsv4_to_posix() appliqué à un texte nfs4_setfacl.
+    existing_default : ACL par défaut actuelle du dossier (conservée si aucune ACE héritable) ;
+    existing_mode : mode actuel (setuid / setgid / sticky conservés).
     Retourne {representable, error, access, default, mode, readback, notes}."""
     notes = []
     aces = parse_nfs4_text(text, is_dir, client_filter, notes)
+    # 1) décodage XDR : les principaux sont résolus en premier (NFS4ERR_BADOWNER)
+    resolved = []
+    for a in aces:
+        who, ident, note = _resolve_principal(a["principal"], bool(a["flag"] & F_GROUP))
+        if note and note not in notes:
+            notes.append(note)
+        resolved.append((who, ident))
+    # 2) traduction (EINVAL → NFS4ERR_ATTRNOTSUPP)
     eff, dfl = _PosixState(), _PosixState()
     ignored = 0
-    for a in aces:
+    for a, (who, ident) in zip(aces, resolved):
         if a["type"] not in (NFS4_ACE_ALLOW, NFS4_ACE_DENY):
             return {"representable": False, "aces": aces,
                     "error": "ACE d'audit / d'alarme (%s) non gérée : knfsd renvoie EINVAL, le client voit "
@@ -898,9 +1010,6 @@ def nfs4_to_posix(text, is_dir, client_filter=True):
         if a["flag"] & NFS4_INHERITANCE_FLAGS and not is_dir:
             return {"representable": False, "aces": aces,
                     "error": "Drapeaux d'héritage sur un fichier (%s) : EINVAL → NFS4ERR_ATTRNOTSUPP" % a["text"]}
-        who, ident, note = _resolve_principal(a["principal"], bool(a["flag"] & F_GROUP))
-        if note:
-            notes.append(note)
         if (a["flag"] & F_GROUP) and a["principal"] in ("OWNER@", "EVERYONE@"):
             notes.append("drapeau g ignoré pour %s" % who)
         mapped = NFS4_READ_MODE | NFS4_WRITE_MODE | NFS4_EXECUTE_MODE | (M_DELETE_CHILD if is_dir else 0)
@@ -922,6 +1031,11 @@ def nfs4_to_posix(text, is_dir, client_filter=True):
             dfl.other = _AceState(eff.other.allow, eff.other.deny)
     access = _state_to_acl(eff, is_dir)
     default = _state_to_acl(dfl, is_dir, default=True) if is_dir else None
+    default_unchanged = is_dir and default is None
+    if default_unchanged:
+        # posix_state_to_acl() renvoie NULL pour l'ACL par défaut sans ACE héritable et
+        # nfsd_setattr() ne la pose que si na_dpacl != NULL : l'ACL par défaut actuelle reste
+        notes.append("Aucune ACE héritable : l'ACL par défaut du dossier est INCHANGÉE (non effacée)")
     if ignored:
         notes.append("Bits sans équivalent POSIX ignorés : %s (seuls r, w+a%s, x comptent ; t, T, c, C, o, y, d, n, N "
                      "sont reconstruits par le serveur)" % (
@@ -936,9 +1050,18 @@ def nfs4_to_posix(text, is_dir, client_filter=True):
         g = acl_get(access, ACL_MASK)
         mode = (acl_get(access, ACL_USER_OBJ) << 6) | ((g if g is not None else acl_get(access, ACL_GROUP_OBJ)) << 3) \
             | acl_get(access, ACL_OTHER)
-    readback = nfs4_view(access, default or [], is_dir)
+        # posix_acl_equiv_mode / posix_acl_update_mode ne touchent qu'aux bits rwx
+        if existing_mode is not None:
+            mode |= existing_mode & SPECIAL_BITS
+        else:
+            notes.append("setuid / setgid / sticky actuels du fichier sont conservés (seuls les bits rwx changent)")
+    readback_default = default if default is not None else (existing_default or [])
+    readback = nfs4_view(access, readback_default if is_dir else [], is_dir)
     return {"representable": True, "error": None, "aces": aces,
-            "access": acl_to_ui(access), "default": acl_to_ui(default) if default else [],
+            "access": acl_to_ui(access),
+            "default": None if default_unchanged else (acl_to_ui(default) if default else []),
+            "default_unchanged": default_unchanged,
+            "current_default": acl_to_ui(existing_default) if default_unchanged and existing_default else [],
             "mode": "%04o" % mode if mode is not None else None,
             "readback": nfs4_render(readback, is_dir), "notes": notes}
 
@@ -946,12 +1069,20 @@ def nfs4_to_posix(text, is_dir, client_filter=True):
 def cmd_nfs4_translate(params):
     """Teste un texte nfs4_setfacl : représentable ? ACL POSIX obtenue ? relecture par le client."""
     is_dir = params.get("is_dir")
-    if params.get("path") and is_dir is None:
+    existing_default, existing_mode = None, None
+    if params.get("path"):
         target = resolve_target(params)
-        is_dir = stat.S_ISDIR(os.lstat(target.path).st_mode)
+        st = os.lstat(target.path)
+        if is_dir is None:
+            is_dir = stat.S_ISDIR(st.st_mode)
+        if stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode):
+            existing_mode = stat.S_IMODE(st.st_mode)
+            if stat.S_ISDIR(st.st_mode):
+                existing_default = raw_acls_for_path(target.path, st)[1]
     try:
         r = nfs4_to_posix(params.get("acl", ""), bool(is_dir if is_dir is not None else True),
-                          client_filter=params.get("client", "nfs4_setfacl") == "nfs4_setfacl")
+                          client_filter=params.get("client", "nfs4_setfacl") == "nfs4_setfacl",
+                          existing_default=existing_default, existing_mode=existing_mode)
     except PermError as e:
         r = {"representable": False, "error": str(e), "aces": []}
     r["is_dir"] = bool(is_dir if is_dir is not None else True)
@@ -959,20 +1090,25 @@ def cmd_nfs4_translate(params):
     return r
 
 
+NFS_NO_ACL_MSG = (
+    "Sans ACL POSIX sur le système de fichiers (acltype=off, ou nfsv4 qui vaut off sous Linux upstream), "
+    "knfsd n'annonce pas l'attribut ACL (aclsupport = 0, fs/nfsd/nfs4xdr.c) et refuse tout SETATTR d'ACL "
+    "(check_attr_support → NFS4ERR_ATTRNOTSUPP ; le client voit EOPNOTSUPP) : nfs4_getfacl ET nfs4_setfacl "
+    "échouent. En NFSv3, le protocole NFSACL ne renvoie que l'ACL minimale dérivée du mode et SETACL échoue. "
+    "Seuls les bits de mode s'appliquent.")
+
+
 def nfsv4_native_support():
-    """Détection sans rien modifier : OpenZFS upstream Linux n'accepte pas acltype=nfsv4.
-    Indices d'une pile patchée (TrueNAS) : outils nfs4xdr_* ou un dataset déjà en nfsv4."""
+    """Détection sans rien modifier. Sous OpenZFS upstream Linux, acltype=nfsv4 est ACCEPTÉ
+    mais se comporte comme off (zfsprops(7)) : un dataset en nfsv4 n'est donc pas un indice.
+    Seuls les outils d'une pile patchée (TrueNAS : nfs4xdr_*) en sont un."""
     import shutil
     hints = [b for b in ("nfs4xdr_getfacl", "nfs4xdr_setfacl") if shutil.which(b)]
-    datasets = []
-    code, out, _e = run(["zfs", "get", "-H", "-o", "name,value", "-t", "filesystem", "acltype"], check=False)
-    if code == 0:
-        datasets = [l.split("\t")[0] for l in out.splitlines() if l.endswith("\tnfsv4")]
-    supported = bool(hints or datasets) or sys.platform.startswith("freebsd")
-    return {"supported": supported, "hints": hints, "datasets": datasets,
-            "message": "ACL NFSv4 natives disponibles (pile patchée détectée)" if supported else
-            "OpenZFS upstream sous Linux : acltype=nfsv4 non supporté (PR openzfs/zfs#16967 non fusionnée). "
-            "Les clients NFSv4 voient les ACL POSIX traduites par knfsd."}
+    supported = bool(hints) or sys.platform.startswith("freebsd")
+    return {"supported": supported, "hints": hints,
+            "message": "ACL NFSv4 natives disponibles (pile patchée détectée : %s)" % ", ".join(hints) if supported else
+            "OpenZFS upstream sous Linux : acltype=nfsv4 est accepté mais équivaut à acltype=off (désactive les "
+            "ACL) ; PR openzfs/zfs#16967 non fusionnée. Les clients NFSv4 voient les ACL POSIX traduites par knfsd."}
 
 
 # --------------------------------------------------------------------------- ZFS
@@ -1423,6 +1559,8 @@ def cmd_inspect(params):
     target = resolve_target(params)
     path = target.path
     props = zfs_props(target.dataset)
+    acltype = norm_prop("acltype", props.get("acltype", {}).get("value"))
+    child_posix = acltype == "posixacl"
     st = os.lstat(path)
     info = describe(path, st)
     acl, acl_error = None, None
@@ -1440,10 +1578,11 @@ def cmd_inspect(params):
                 try:
                     cst = de.stat(follow_symlinks=False)
                     child = describe(de.path, cst)
-                    if stat.S_ISREG(cst.st_mode) or stat.S_ISDIR(cst.st_mode):
+                    if child_posix and (stat.S_ISREG(cst.st_mode) or stat.S_ISDIR(cst.st_mode)):
                         ca, cd = raw_acls_for_path(de.path, cst)
                         cv = nfs4_view(ca, cd, stat.S_ISDIR(cst.st_mode))
                         child["nfs4_text"] = nfs4_render(cv, stat.S_ISDIR(cst.st_mode))
+                        child["nfs4_numeric_text"] = nfs4_render(cv, stat.S_ISDIR(cst.st_mode), numeric=True)
                         child["nfs4_deny"] = sum(1 for a in cv if a["type"] == NFS4_ACE_DENY)
                     children.append(child)
                 except (OSError, PermError):
@@ -1467,10 +1606,17 @@ def cmd_inspect(params):
         warnings.append("Le chemin demandé contient un lien symbolique : affichage de la cible réelle %s, écriture refusée" % path)
     if target.mountpoint in SYSTEM_MOUNTS:
         warnings.append("Dataset système (monté sur %s) : les modifications sont refusées" % target.mountpoint)
-    nfs4 = None
+    nfs4, nfs3 = None, None
+    posix_fs = acltype == "posixacl"
     if stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode):
         try:
             ra, rd = raw_acls_for_path(path, st)
+            nfs3 = nfs3_view(ra, rd, stat.S_ISDIR(st.st_mode), posix_fs, st.st_mode)
+        except PermError as e:
+            nfs3 = {"error": str(e)}
+        try:
+            if not posix_fs:
+                raise _NoAcl()
             nfs4 = nfs4_view_for(ra, rd, stat.S_ISDIR(st.st_mode))
             nfs4["numeric_text"] = nfs4_render(nfs4_view(ra, rd, stat.S_ISDIR(st.st_mode)),
                                                stat.S_ISDIR(st.st_mode), numeric=True)
@@ -1480,13 +1626,19 @@ def cmd_inspect(params):
             if info["has_ntacl"]:
                 nfs4["notes"].append("security.NTACL (ACL Windows de ksmbd / Samba acl_xattr) est invisible et "
                                      "non appliquée côté NFS : seules les ACL POSIX comptent pour les clients NFSv4")
+        except _NoAcl:
+            native = nfsv4_native_support()
+            nfs4 = {"unsupported": True, "aces": [], "text": [], "numeric_text": [], "deny_count": 0,
+                    "idmap": idmap_info(), "native": native,
+                    "message": native["message"] if (native["supported"] and acltype == "nfsv4") else NFS_NO_ACL_MSG,
+                    "notes": []}
         except PermError as e:
             nfs4 = {"error": str(e)}
     return {
         "path": path, "dataset": target.dataset, "mountpoint": target.mountpoint,
         "props": props, "info": info, "acl": acl, "acl_error": acl_error,
         "children": children, "warnings": warnings,
-        "acl_mode": acl_mode_for(target.dataset), "nfs4_view": nfs4,
+        "acl_mode": acl_mode_for(target.dataset), "nfs4_view": nfs4, "nfs3_view": nfs3,
     }
 
 
@@ -1583,9 +1735,8 @@ def cmd_audit(params):
         notes = []
         if nfs4["xattr"] == "dir":
             notes.append("xattr=dir : les ACL sont des fichiers cachés, chaque GETATTR NFS les relit ; passez en xattr=sa")
-        if nfs4["acltype"] == "off":
-            notes.append("acltype=off : les clients NFSv4 ne verront que OWNER@ / GROUP@ / EVERYONE@ et "
-                         "nfs4_setfacl avec des entrées nommées échouera")
+        if nfs4["acltype"] != "posixacl" and not nfs4["native"]["supported"]:
+            notes.append(NFS_NO_ACL_MSG)
         if nfs4["orphans"]:
             notes.append("UID / GID sans nom : avec sec=sys et nfs4_disable_idmapping=Y le client voit le numéro ; "
                          "avec sec=krb5* ou idmapping actif, il voit nobody")
@@ -2350,11 +2501,14 @@ def cmd_preset(params):
         native = nfsv4_native_support()
         notes.append(native["message"])
         if not native["supported"]:
-            notes.append("Utilisez plutôt « nfsv4-posix » : knfsd présente les ACL POSIX comme des ACL NFSv4")
+            notes.append("Sous Linux upstream, acltype=nfsv4 = acltype=off : cela DÉSACTIVE les ACL "
+                         "(plus d'ACL nfsacl en NFSv3, plus d'attribut ACL en NFSv4). Utilisez « nfsv4-posix ».")
             if not params.get("dry_run", True):
-                raise PermError("acltype=nfsv4 non supporté par OpenZFS upstream sous Linux : rien n'a été modifié")
+                raise PermError("acltype=nfsv4 équivaut à acltype=off sous OpenZFS upstream Linux (désactive les ACL) : "
+                                "rien n'a été modifié")
     if params.get("preset") == "nfsv4-posix":
-        notes.append("Export : n'utilisez pas l'option no_acl ; sec=krb5i/krb5p pour des noms fiables ; "
+        notes.append("Export : l'option no_acl est sans effet sur knfsd récent (NFSEXP_NOACL n'est lu nulle part) ; "
+                     "sec=krb5i/krb5p pour des noms fiables ; "
                      "NFSv4.1 n'a pas les xattrs utilisateur (NFSv4.2 seulement)")
     if params.get("preset") in ("noacl-unix", "posixacl-smb", "nfsv4-posix"):
         notes.append("Changer acltype n'efface pas les ACL existantes : utilisez la réinitialisation « Retirer les ACL » si besoin")
@@ -2369,6 +2523,431 @@ def cmd_preset(params):
             "errors": errors, "notes": notes}
 
 
+# --------------------------------------------------------------------------- NFSv3 + NFSv4.1 : exports et sharenfs
+
+# Clés acceptées par OpenZFS dans sharenfs sous Linux (lib/libzfs/os/linux/libzfs_share_nfs.c,
+# get_linux_shareopts_cb) + rw / ro (listes d'hôtes séparées par « : »), sec, anon, root_mapping, nosub
+SHARENFS_KEYS = {
+    "all_squash", "anongid", "anonuid", "async", "auth_nlm", "crossmnt", "fsid", "fsuid", "hide",
+    "insecure", "insecure_locks", "mountpoint", "mp", "no_acl", "no_all_squash", "no_auth_nlm",
+    "no_root_squash", "no_subtree_check", "no_wdelay", "nohide", "refer", "replicas", "root_squash",
+    "secure", "secure_locks", "subtree_check", "sync", "wdelay",
+    "rw", "ro", "sec", "anon", "root_mapping", "nosub",
+}
+SHARENFS_CHARS = re.compile(r"[A-Za-z0-9_=,.:@/*\-\[\]]{1,1024}")
+EXPORT_OPT_CHARS = re.compile(r"[A-Za-z0-9_=,.:@/\-]{1,1024}")
+CLIENT_CHARS = re.compile(r"[A-Za-z0-9_.*?:@/\-\[\]]{1,255}")
+DATASET_CHARS = re.compile(r"[A-Za-z0-9_.:\-]+(/[A-Za-z0-9_.:\- ]+)*")
+
+
+def exports_paths():
+    main = os.environ.get("COCKPIT_ZFS_EXPORTS", "/etc/exports")
+    d = os.environ.get("COCKPIT_ZFS_EXPORTS_D", "/etc/exports.d")
+    files = [main]
+    try:
+        files += [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith(".exports")]
+    except OSError:
+        pass
+    return files
+
+
+def _unescape_export_path(p):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), p)
+
+
+def escape_export_path(p):
+    """Comme nfs_escape_mountpoint() d'OpenZFS : espaces, tabulations, retours et « \\ » en octal."""
+    return "".join("\\%03o" % ord(c) if c in "\t\n\v\f\r \\" else c for c in p)
+
+
+def _split_tokens(line):
+    toks, cur, quote = [], "", False
+    for ch in line:
+        if ch == '"':
+            quote = not quote
+            continue
+        if ch.isspace() and not quote:
+            if cur:
+                toks.append(cur)
+                cur = ""
+            continue
+        cur += ch
+    if cur:
+        toks.append(cur)
+    return toks
+
+
+def parse_exports_text(text, fname):
+    """Lecture minimale d'un fichier exports(5) : chemin, clients et options."""
+    entries, logical, start = [], "", 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        if not logical:
+            start = n
+        line = raw.rstrip()
+        if line.endswith("\\") and not line.endswith("\\\\"):
+            logical += line[:-1] + " "
+            continue
+        logical += line
+        body = logical.split("#", 1)[0].strip()
+        logical = ""
+        if not body:
+            continue
+        toks = _split_tokens(body)
+        path = _unescape_export_path(toks[0])
+        defaults, clients, notes = [], [], []
+        for t in toks[1:]:
+            if t.startswith("-"):
+                defaults = [o for o in t[1:].split(",") if o]
+                continue
+            m = re.fullmatch(r"([^()]*)(?:\(([^)]*)\))?", t)
+            if not m:
+                notes.append("élément illisible : %s" % t)
+                continue
+            host = m.group(1) or "*"
+            if not m.group(1) and m.group(2) is not None:
+                notes.append("« (%s) » sans hôte : exporté à TOUS les clients (espace avant la parenthèse ?)" % m.group(2))
+            opts = defaults + [o for o in (m.group(2) or "").split(",") if o]
+            clients.append({"host": host, "options": opts})
+        if not clients:
+            clients.append({"host": "*", "options": defaults})
+            notes.append("aucun client indiqué : exporté à tous (*)")
+        entries.append({"path": os.path.normpath(path), "file": fname, "line": start, "clients": clients,
+                        "source": "sharenfs" if os.path.basename(fname) == "zfs.exports" else "manuel",
+                        "notes": notes})
+    return entries
+
+
+def read_exports():
+    out = []
+    for f in exports_paths():
+        try:
+            with open(f, errors="surrogateescape") as fh:
+                out += parse_exports_text(fh.read(), f)
+        except OSError:
+            pass
+    return out
+
+
+def _opt_value(options, key):
+    for o in options:
+        k, _, v = o.partition("=")
+        if k == key:
+            return v if _ else True
+    return None
+
+
+def fsid_from_guid(guid):
+    h = "%032x" % (int(guid) & ((1 << 128) - 1))
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def _list_datasets(dataset):
+    if not dataset or not DATASET_CHARS.fullmatch(dataset) or dataset.startswith("-"):
+        raise PermError("Nom de dataset invalide")
+    _c, out, _e = run(["zfs", "list", "-H", "-p", "-r", "-t", "filesystem", "-o",
+                       "name,mountpoint,mounted,sharenfs,acltype,xattr,guid", dataset])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        rows.append({"name": parts[0], "mountpoint": parts[1], "mounted": parts[2] == "yes",
+                     "sharenfs": parts[3], "acltype": norm_prop("acltype", parts[4]), "xattr": parts[5],
+                     "guid": parts[6]})
+    _c, out, _e = run(["zfs", "get", "-H", "-p", "-r", "-t", "filesystem", "-o", "name,value,source",
+                       "sharenfs", dataset], check=False)
+    src = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            src[parts[0]] = parts[2]
+    for r in rows:
+        r["sharenfs_source"] = src.get(r["name"], "")
+        r["path"] = os.path.normpath(r["mountpoint"]) if r["mountpoint"].startswith("/") else None
+    return rows
+
+
+def _sharenfs_world_rw(value):
+    if value == "on":
+        return True
+    opts = value.split(",")
+    for o in opts:
+        k, eq, v = o.partition("=")
+        if k == "rw" and (not eq or not v):
+            return True
+    return not any(o.partition("=")[0] in ("rw", "ro") for o in opts)
+
+
+def _acl_counts(path):
+    try:
+        st = os.lstat(path)
+        a, d = raw_acls_for_path(path, st)
+        return len(a), len(d)
+    except (OSError, PermError):
+        return None, None
+
+
+def cmd_nfs_datasets(params):
+    """Compatibilité NFSv3 + NFSv4.1 de chaque dataset sous `dataset`."""
+    rows = _list_datasets(params.get("dataset"))
+    exports = read_exports()
+    by_path = {}
+    for e in exports:
+        by_path.setdefault(e["path"], []).append(e)
+    fsid_users = {}
+    for e in exports:
+        for c in e["clients"]:
+            v = _opt_value(c["options"], "fsid")
+            if v and v is not True:
+                fsid_users.setdefault(str(v).lower(), set()).add(e["path"])
+    scan = bool(params.get("scan_acls"))
+    max_entries = int(params.get("max_entries", 200000))
+    exported = {}
+    for r in rows:
+        mnt = r["path"]
+        manual = [e for e in by_path.get(mnt, []) if e["source"] == "manuel"] if mnt else []
+        zfs_lines = [e for e in by_path.get(mnt, []) if e["source"] == "sharenfs"] if mnt else []
+        r["exports"] = manual + zfs_lines
+        r["sharenfs_on"] = r["sharenfs"] not in ("off", "-", "")
+        r["exported"] = bool(manual or (r["sharenfs_on"] and r["mounted"]))
+        exported[r["name"]] = r
+    names = [r["name"] for r in rows]
+    for r in rows:
+        f = []
+
+        def add(level, code, msg):
+            f.append({"level": level, "code": code, "message": msg})
+        opts = [o for e in r["exports"] for c in e["clients"] for o in c["options"]]
+        if r["sharenfs_on"]:
+            opts += [o for o in r["sharenfs"].split(",") if o]
+        parent = None
+        for other in reversed(names[:names.index(r["name"])]):
+            if r["name"].startswith(other + "/") and exported[other]["exported"]:
+                parent = exported[other]
+                break
+        if not r["mounted"] or not r["path"]:
+            add("info", "not_mounted", "Non monté (ou mountpoint=%s) : rien n'est exporté ; sharenfs n'exporte que "
+                "les datasets montés (option mountpoint ajoutée par OpenZFS)" % r["mountpoint"])
+        elif not r["exported"] and parent:
+            p_opts = [o for e in parent["exports"] for c in e["clients"] for o in c["options"]] + \
+                (parent["sharenfs"].split(",") if parent["sharenfs_on"] else [])
+            if "crossmnt" in p_opts or parent["sharenfs"] == "on":
+                add("warning", "implicit_child",
+                    "Pas d'export explicite : atteint seulement par traversée grâce à crossmnt sur %s (export implicite "
+                    "aux options du parent, géré par mountd), sans fsid propre et non montable directement par un "
+                    "client NFSv3 : ajoutez un export explicite" % parent["name"])
+            else:
+                add("error", "hidden_child",
+                    "Non exporté alors que %s l'est : en NFSv3 comme en NFSv4.1, le client voit le dossier VIDE du "
+                    "point de montage (nfsd_cross_mnt ne traverse que vers un export) : ajoutez un export explicite"
+                    % parent["name"])
+        if r["exported"] and parent:
+            p_opts = [o for e in parent["exports"] for c in e["clients"] for o in c["options"]] + \
+                (parent["sharenfs"].split(",") if parent["sharenfs_on"] else [])
+            if "crossmnt" not in p_opts and parent["sharenfs"] != "on" and "nohide" not in opts:
+                add("info", "v3_mount_separately",
+                    "NFSv3 : un client qui monte %s voit ce dossier vide (traversée v3 seulement avec crossmnt sur le "
+                    "parent ou nohide ici) ; NFSv4.1 traverse automatiquement. Montez-le séparément en v3, ou ajoutez "
+                    "crossmnt au parent" % parent["name"])
+        manual = [e for e in r["exports"] if e["source"] == "manuel"]
+        if manual and r["sharenfs_on"]:
+            add("error", "duplicate",
+                "Exporté à la fois par sharenfs (%s) et par %s : deux définitions pour le même chemin, la dernière "
+                "lue par exportfs l'emporte ; gardez-en une seule (et ne laissez pas cockpit-file-sharing gérer ce "
+                "chemin si sharenfs est utilisé)" % (r["sharenfs"], ", ".join(sorted({e["file"] for e in manual}))))
+        if r["sharenfs_on"] and r["sharenfs_source"].startswith("inherited"):
+            add("info", "sharenfs_inherited", "sharenfs hérité (%s) : ce dataset est exporté automatiquement avec les "
+                "options du parent" % r["sharenfs_source"])
+            if _opt_value(r["sharenfs"].split(","), "fsid"):
+                add("error", "fsid_inherited", "fsid défini dans un sharenfs hérité : même fsid que le parent, les "
+                    "clients confondront les deux systèmes de fichiers ; mettez fsid en local ou retirez-le")
+        if r["sharenfs_on"] and _sharenfs_world_rw(r["sharenfs"]):
+            add("warning", "world", "sharenfs=%s exporte vers TOUS les clients (*)%s" % (
+                r["sharenfs"], " en lecture-écriture" if r["sharenfs"] == "on" or "rw" in r["sharenfs"] else ""))
+        for e in manual:
+            for n in e["notes"]:
+                add("warning", "export_note", "%s:%d : %s" % (e["file"], e["line"], n))
+        fsids = {str(_opt_value(c["options"], "fsid")).lower() for e in r["exports"] for c in e["clients"]
+                 if _opt_value(c["options"], "fsid") not in (None, True)}
+        for v in fsids:
+            others = fsid_users.get(v, set()) - {r["path"]}
+            if others:
+                add("error", "fsid_duplicate", "fsid=%s aussi utilisé par %s : les clients confondraient ces systèmes "
+                    "de fichiers" % (v, ", ".join(sorted(others))))
+        if r["exported"] and not fsids and not _opt_value(r["sharenfs"].split(","), "fsid"):
+            add("info", "no_fsid", "Pas de fsid : nfs-utils dérive l'identifiant du dataset (statfs) ; un fsid "
+                "explicite reste stable même après zfs send / receive (le générateur propose fsid=<guid>)")
+        if r["exported"] and not _opt_value(opts, "sec"):
+            add("info", "sec_default", "Pas de sec= : sec=sys par défaut (UID / GID envoyés par le client)")
+        if r["acltype"] != "posixacl":
+            add("error" if r["exported"] else "warning", "no_posix_acl",
+                "acltype=%s : %s" % (r["acltype"], NFS_NO_ACL_MSG))
+        if r["xattr"] == "dir":
+            add("warning", "xattr_dir", "xattr=dir : chaque ACL est un fichier caché relu à chaque GETACL / GETATTR ; "
+                "passez en xattr=sa")
+        over = []
+        if r["path"] and r["mounted"] and r["acltype"] == "posixacl":
+            na, nd = _acl_counts(r["path"])
+            r["root_acl_entries"] = {"access": na, "default": nd}
+            if (na or 0) > NFS_ACL_MAX_ENTRIES or (nd or 0) > NFS_ACL_MAX_ENTRIES:
+                over.append(r["path"])
+            if scan:
+                try:
+                    tgt = resolve_target({"path": r["path"]}).open()
+                    try:
+                        count = 0
+                        for ent in walk(tgt, {"cross_datasets": False}):
+                            count += 1
+                            if count > max_entries:
+                                add("info", "scan_truncated", "Analyse des ACL arrêtée après %d objets" % max_entries)
+                                break
+                            a = read_access(ent.fd, ent.st)
+                            d = read_default(ent.fd) if ent.is_dir else []
+                            if len(a) > NFS_ACL_MAX_ENTRIES or len(d) > NFS_ACL_MAX_ENTRIES:
+                                if len(over) < 50:
+                                    over.append(ent.path)
+                    finally:
+                        tgt.close()
+                except (OSError, PermError) as e:
+                    add("warning", "scan_error", "Analyse des ACL impossible : %s" % e)
+        for o in over:
+            add("error", "acl_too_long", "%s : ACL de plus de %d entrées, GETACL NFSv3 échoue (nfsacl_encode → "
+                "EINVAL) et l'attribut ACL NFSv4 est refusé" % (o, NFS_ACL_MAX_ENTRIES))
+        r["findings"] = f
+        blocking = {"hidden_child", "duplicate", "fsid_duplicate", "fsid_inherited", "no_posix_acl", "acl_too_long",
+                    "not_mounted", "implicit_child"}
+        ok = r["exported"] and not any(x["code"] in blocking for x in f)
+        r["compat"] = {"v3": ok, "v41": ok,
+                       "summary": "NFSv3 + NFSv4.1 : prêt" if ok else
+                       ("non exporté" if not r["exported"] else "à corriger")}
+    return {"dataset": params.get("dataset"), "datasets": rows, "exports": exports,
+            "exports_files": exports_paths(),
+            "notes": [
+                "NFSv3 ne traverse pas les points de montage sans crossmnt / nohide : chaque dataset enfant doit être "
+                "exporté explicitement pour être monté directement en NFSv3.",
+                "NFSv3 : les ACL POSIX passent telles quelles par le protocole NFSACL (identifiants numériques) ; "
+                "NFSv4.1 : knfsd les traduit en ACL NFSv4.",
+                "sharenfs (/etc/exports.d/zfs.exports) et cockpit-file-sharing ne doivent pas gérer le même chemin.",
+            ]}
+
+
+def _validate_clients(clients):
+    out = []
+    for c in clients or []:
+        c = str(c).strip()
+        if not c:
+            continue
+        if not CLIENT_CHARS.fullmatch(c):
+            raise PermError("Client invalide : %r" % c)
+        out.append(c)
+    if not out:
+        raise PermError("Indiquez au moins un client (adresse, réseau CIDR, nom ou *)")
+    return out
+
+
+def cmd_nfs_generate(params):
+    """Lignes d'export (ou valeurs sharenfs) pour les datasets sans export explicite.
+    N'écrit rien : renvoie le texte à copier ou les commandes à lancer."""
+    rows = cmd_nfs_datasets({"dataset": params.get("dataset")})["datasets"]
+    fmt = params.get("format", "exports")
+    clients = _validate_clients(params.get("clients"))
+    options = str(params.get("options", "rw,sync,no_subtree_check,sec=sys")).strip().strip(",")
+    if not EXPORT_OPT_CHARS.fullmatch(options):
+        raise PermError("Options invalides : %r" % options)
+    opt_list = [o for o in options.split(",") if o]
+    if any(o.partition("=")[0] == "fsid" for o in opt_list):
+        raise PermError("Ne mettez pas fsid dans les options communes : il doit être unique par dataset")
+    fsid_mode = params.get("fsid", "guid" if fmt == "exports" else "none")
+    include_all = bool(params.get("include_exported"))
+    lines, commands, skipped, notes = [], [], [], []
+    for r in rows:
+        if not r["path"] or not r["mounted"]:
+            skipped.append({"name": r["name"], "reason": "non monté"})
+            continue
+        if r["exported"] and not include_all:
+            continue
+        per = list(opt_list)
+        if fsid_mode == "guid":
+            per.append("fsid=" + fsid_from_guid(r["guid"]))
+        if fmt == "exports":
+            line = escape_export_path(r["path"]) + " " + " ".join("%s(%s)" % (c, ",".join(per)) for c in clients)
+            lines.append({"name": r["name"], "line": line})
+        elif fmt == "sharenfs":
+            access = "ro" if "ro" in per else "rw"
+            hosts = ":".join(("@" + c) if re.match(r"^[0-9a-fA-F:.]+/\d+$", c) else c for c in clients if c != "*")
+            rest = [o for o in per if o not in ("rw", "ro") and o.partition("=")[0] in SHARENFS_KEYS]
+            dropped = [o for o in per if o not in ("rw", "ro") and o.partition("=")[0] not in SHARENFS_KEYS]
+            if dropped:
+                notes.append("Options sans équivalent sharenfs ignorées : %s" % ", ".join(sorted(set(dropped))))
+            value = ",".join(["%s=%s" % (access, hosts) if hosts else access] + rest)
+            if not SHARENFS_CHARS.fullmatch(value):
+                raise PermError("Valeur sharenfs générée invalide : %r" % value)
+            commands.append({"name": r["name"], "value": value,
+                             "command": "zfs set sharenfs=%s %s" % (value, r["name"])})
+        else:
+            raise PermError("Format inconnu : %s" % fmt)
+    if fmt == "exports":
+        notes.append("À copier dans /etc/exports ou /etc/exports.d/<nom>.exports, puis : exportfs -ra")
+        notes.append("Un export par dataset : NFSv3 peut monter chaque dataset, NFSv4.1 les traverse depuis le parent")
+    else:
+        notes.append("sharenfs est hérité : un futur dataset enfant sera exporté automatiquement avec les options du parent")
+        if fsid_mode == "guid":
+            notes.append("fsid défini localement sur chaque dataset ; un nouvel enfant en hériterait : redéfinissez-le")
+    return {"format": fmt, "lines": lines, "commands": commands, "skipped": skipped, "notes": notes,
+            "text": "\n".join(l["line"] for l in lines) if fmt == "exports" else
+            "\n".join(c["command"] for c in commands)}
+
+
+def validate_sharenfs(value):
+    value = str(value).strip()
+    if value in ("on", "off"):
+        return value
+    if not SHARENFS_CHARS.fullmatch(value):
+        raise PermError("Valeur sharenfs refusée : caractères autorisés A-Z a-z 0-9 _ = , . : @ / * - [ ] "
+                        "(pas d'espace, de « ; » ni de retour à la ligne)")
+    for o in value.split(","):
+        if not o:
+            continue
+        k = o.partition("=")[0]
+        if k.startswith("-") or k not in SHARENFS_KEYS:
+            raise PermError("Option sharenfs inconnue d'OpenZFS : %s (le partage échouerait : SA_SYNTAX_ERR)" % k)
+    return value
+
+
+def cmd_nfs_sharenfs(params):
+    dataset = params.get("dataset", "")
+    if not DATASET_CHARS.fullmatch(dataset or "") or dataset.startswith("-"):
+        raise PermError("Nom de dataset invalide")
+    op = params.get("op", "set")
+    rows = [r for r in _list_datasets(dataset) if r["name"] == dataset]
+    if not rows:
+        raise PermError("Dataset introuvable : %s" % dataset)
+    r = rows[0]
+    notes = ["sharenfs écrit /etc/exports.d/zfs.exports et relance exportfs : ne gérez pas ce chemin aussi dans "
+             "cockpit-file-sharing ou /etc/exports",
+             "sharenfs est hérité par les datasets enfants"]
+    if op == "set":
+        value = validate_sharenfs(params.get("value", ""))
+        cmd = ["zfs", "set", "sharenfs=%s" % value, dataset]
+        if value != "off" and r["path"]:
+            manual = [e for e in read_exports() if e["path"] == r["path"] and e["source"] == "manuel"]
+            if manual and not params.get("force"):
+                raise PermError("%s est déjà exporté par %s : retirez cette ligne d'abord (ou forcez)" % (
+                    r["path"], ", ".join(sorted({e["file"] for e in manual}))))
+            if _opt_value(value.split(","), "fsid"):
+                notes.append("fsid dans sharenfs : les enfants en hériteront (même fsid) ; redéfinissez-le sur chacun")
+            if _sharenfs_world_rw(value):
+                notes.append("ATTENTION : exporté vers tous les clients (*)")
+    elif op == "inherit":
+        cmd = ["zfs", "inherit", "sharenfs", dataset]
+    else:
+        raise PermError("Opération inconnue : %s" % op)
+    if params.get("dry_run", True):
+        return {"dry_run": True, "command": " ".join(cmd), "notes": notes, "current": r["sharenfs"],
+                "current_source": r["sharenfs_source"]}
+    run(cmd)
+    return {"dry_run": False, "command": " ".join(cmd), "notes": notes}
+
 # --------------------------------------------------------------------------- main
 
 COMMANDS = {
@@ -2382,6 +2961,9 @@ COMMANDS = {
     "delegate": cmd_delegate,
     "preset": cmd_preset,
     "nfs4-translate": cmd_nfs4_translate,
+    "nfs-datasets": cmd_nfs_datasets,
+    "nfs-generate": cmd_nfs_generate,
+    "nfs-sharenfs": cmd_nfs_sharenfs,
     "nfsv4-support": lambda _p: dict(nfsv4_native_support(), idmap=idmap_info()),
     "methods": lambda _p: {"methods": RESET_METHODS, "presets": {k: v["label"] for k, v in PRESETS.items()}},
 }

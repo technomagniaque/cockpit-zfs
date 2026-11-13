@@ -36,8 +36,10 @@ export interface PathInfo {
 	has_posix_acl: boolean;
 	immutable: boolean;
 	append_only: boolean;
-	/** ACL telle que vue par un client NFSv4 (rendu nfs4_getfacl, identifiants numériques) */
+	/** ACL telle que vue par un client NFSv4 (rendu nfs4_getfacl, noms user@domaine ; nobody si sans nom) */
 	nfs4_text?: string[];
+	/** même rendu avec identifiants numériques (sec=sys et nfs4_disable_idmapping=Y) */
+	nfs4_numeric_text?: string[];
 	nfs4_deny?: number;
 }
 
@@ -47,6 +49,13 @@ export interface IdmapInfo {
 	/** /sys/module/nfsd/parameters/nfs4_disable_idmapping ; null si nfsd n'est pas chargé */
 	disable_idmapping: boolean | null;
 	nfsd_loaded: boolean;
+	nobody_user?: string;
+	nobody_group?: string;
+}
+
+/** Rendu numérique par défaut : nfs4_disable_idmapping vaut Y par défaut (sec=sys → identifiants). */
+export function prefersNumeric(idmap?: IdmapInfo | null) {
+	return idmap?.disable_idmapping !== false;
 }
 
 export interface Nfs4Ace {
@@ -69,13 +78,28 @@ export interface Nfs4View {
 	notes?: string[];
 	idmap?: IdmapInfo;
 	error?: string;
+	/** le FS n'a pas d'ACL POSIX : knfsd n'annonce pas l'attribut ACL */
+	unsupported?: boolean;
+	message?: string;
 }
 
 export interface Nfs4NativeSupport {
 	supported: boolean;
 	hints: string[];
-	datasets: string[];
 	message: string;
+}
+
+/** Vue d'un client NFSv3 (protocole NFSACL : ACL POSIX transmises telles quelles, identifiants numériques). */
+export interface Nfs3View {
+	text?: string[];
+	numeric_text?: string[];
+	entries_access?: number;
+	entries_default?: number;
+	limit?: number;
+	over_limit?: boolean;
+	posix_fs?: boolean;
+	notes?: string[];
+	error?: string;
 }
 
 export interface Nfs4TranslateResult {
@@ -83,7 +107,10 @@ export interface Nfs4TranslateResult {
 	error: string | null;
 	is_dir: boolean;
 	access?: AclEntry[];
-	default?: AclEntry[];
+	/** null : aucune ACE héritable, l'ACL par défaut actuelle est conservée */
+	default?: AclEntry[] | null;
+	default_unchanged?: boolean;
+	current_default?: AclEntry[];
 	mode?: string | null;
 	readback?: string[];
 	notes?: string[];
@@ -102,6 +129,61 @@ export interface InspectResult {
 	warnings: string[];
 	acl_mode: 'posix' | 'off' | 'nfsv4';
 	nfs4_view: Nfs4View | null;
+	nfs3_view: Nfs3View | null;
+}
+
+export interface NfsFinding {
+	level: 'error' | 'warning' | 'info';
+	code: string;
+	message: string;
+}
+
+export interface ExportClient {
+	host: string;
+	options: string[];
+}
+
+export interface ExportEntry {
+	path: string;
+	file: string;
+	line: number;
+	clients: ExportClient[];
+	source: 'manuel' | 'sharenfs';
+	notes: string[];
+}
+
+export interface NfsDataset {
+	name: string;
+	mountpoint: string;
+	path: string | null;
+	mounted: boolean;
+	sharenfs: string;
+	sharenfs_source: string;
+	sharenfs_on: boolean;
+	acltype: string;
+	xattr: string;
+	exported: boolean;
+	exports: ExportEntry[];
+	findings: NfsFinding[];
+	root_acl_entries?: { access: number | null; default: number | null };
+	compat: { v3: boolean; v41: boolean; summary: string };
+}
+
+export interface NfsDatasetsResult {
+	dataset: string;
+	datasets: NfsDataset[];
+	exports: ExportEntry[];
+	exports_files: string[];
+	notes: string[];
+}
+
+export interface NfsGenerateResult {
+	format: 'exports' | 'sharenfs';
+	lines: { name: string; line: string }[];
+	commands: { name: string; value: string; command: string }[];
+	skipped: { name: string; reason: string }[];
+	notes: string[];
+	text: string;
 }
 
 export interface WalkOptions {
@@ -227,6 +309,12 @@ export const applyPreset = (dataset: string, preset: string, dryRun: boolean) =>
 /** Teste un texte nfs4_setfacl : représentable en POSIX par knfsd ? */
 export const nfs4Translate = (params: { acl: string; path?: string; is_dir?: boolean; client?: 'nfs4_setfacl' | 'autre' }) =>
 	permissionsCall<Nfs4TranslateResult>('nfs4-translate', params);
+export const nfsDatasets = (dataset: string, scanAcls = false) =>
+	permissionsCall<NfsDatasetsResult>('nfs-datasets', { dataset, scan_acls: scanAcls });
+export const nfsGenerate = (params: { dataset: string; clients: string[]; options?: string; format: 'exports' | 'sharenfs'; fsid?: 'guid' | 'none'; include_exported?: boolean }) =>
+	permissionsCall<NfsGenerateResult>('nfs-generate', params);
+export const nfsSharenfs = (params: { dataset: string; op: 'set' | 'inherit'; value?: string; dry_run: boolean; force?: boolean }) =>
+	permissionsCall<{ dry_run: boolean; command: string; notes: string[]; current?: string; current_source?: string }>('nfs-sharenfs', params);
 export const nfsv4Support = () => permissionsCall<Nfs4NativeSupport & { idmap: IdmapInfo }>('nfsv4-support');
 export const getMethods = () =>
 	permissionsCall<{ methods: Record<ResetMethod, string>; presets: Record<string, string> }>('methods');

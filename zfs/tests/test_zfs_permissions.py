@@ -774,7 +774,7 @@ class _Nfs4CommandTests:
         d = self.ok("preset", dataset="tank/data", preset="nfsv4-posix", dry_run=True)
         self.assertEqual(d["commands"], ["zfs set dnodesize=auto tank/data"])
         d = self.ok("preset", dataset="tank/data", preset="nfsv4", dry_run=True)
-        self.assertTrue(any("non supporté" in n for n in d["notes"]))
+        self.assertTrue(any("acltype=off" in n for n in d["notes"]))
         d = self.call("preset", dataset="tank/data", preset="nfsv4", dry_run=False)
         self.assertFalse(d["ok"])
 
@@ -782,6 +782,279 @@ class _Nfs4CommandTests:
 for _name, _fn in list(vars(_Nfs4CommandTests).items()):
     if _name.startswith("test_"):
         setattr(PermissionsTest, _name, _fn)
+
+class _Nfs4ReviewTests:
+    """Corrections de la revue NFSv4 (greffées sur PermissionsTest)."""
+
+    def test_translate_default_inchangee(self):
+        # dossier avec ACL par défaut existante ; ACL envoyée sans ACE héritable
+        subprocess.run(["setfacl", "-d", "-m", "u:nobody:rwx", self.p("a")], check=True)
+        d = self.ok("nfs4-translate", acl="A::OWNER@:rwaDxtTcCy,A::GROUP@:rxtcy,A::EVERYONE@:rxtcy",
+                    path=self.p("a"))
+        self.assertTrue(d["representable"])
+        self.assertTrue(d["default_unchanged"])
+        self.assertIsNone(d["default"])
+        self.assertTrue(any("INCHANGÉE" in n for n in d["notes"]))
+        # la relecture inclut l'ACL par défaut actuelle (ACE d'héritage)
+        self.assertTrue(any(":fdi:" in t for t in d["readback"]), d["readback"])
+
+    def test_native_support_ignore_dataset_nfsv4(self):
+        self.env["FAKE_ACLTYPE"] = "nfsv4"
+        d = self.ok("nfsv4-support")
+        self.assertFalse(d["supported"])
+        self.assertIn("acltype=off", d["message"])
+
+    def test_inspect_sans_acl_posix(self):
+        self.env["FAKE_ACLTYPE"] = "off"
+        d = self.ok("inspect", path=self.p("a"))
+        self.assertTrue(d["nfs4_view"]["unsupported"])
+        self.assertEqual(d["nfs4_view"]["text"], [])
+        self.assertIn("ATTRNOTSUPP", d["nfs4_view"]["message"])
+        self.assertFalse(d["nfs3_view"]["posix_fs"])
+        self.assertTrue(any("EOPNOTSUPP" in n for n in d["nfs3_view"]["notes"]))
+        self.assertNotIn("nfs4_text", d["children"][0])
+
+    def test_principal_numerique_strict(self):
+        for bad in ("²", "4294967295", "12345678901"):
+            d = self.ok("nfs4-translate", acl="A::%s:r,A::OWNER@:rw,A::GROUP@:r,A::EVERYONE@:" % bad, is_dir=False)
+            self.assertFalse(d["representable"], bad)
+            self.assertIn("BADOWNER", d["error"])
+        d = self.ok("nfs4-translate", acl="A::OWNER@:rw,A::GROUP@:r,A::EVERYONE@:,A::1234:r", is_dir=False)
+        self.assertTrue(any("nfs4_disable_idmapping" in n for n in d["notes"]))
+        d = self.ok("nfs4-translate", acl="A::OWNER@:rw,A::GROUP@:r,A::EVERYONE@:,A::root:r", is_dir=False)
+        self.assertTrue(any("sans @domaine" in n for n in d["notes"]))
+
+    def test_badowner_avant_einval(self):
+        # principal inconnu ET drapeau d'héritage sur un fichier : BADOWNER d'abord (décodage XDR)
+        d = self.ok("nfs4-translate", acl="A:fd:inconnu-xyz@x:r", is_dir=False, client="autre")
+        self.assertFalse(d["representable"])
+        self.assertIn("BADOWNER", d["error"])
+
+    def test_mode_conserve_bits_speciaux(self):
+        os.chmod(self.p("a"), 0o2775)
+        d = self.ok("nfs4-translate", acl="A::OWNER@:rwaDxtTcCy,A::GROUP@:rxtcy,A::EVERYONE@:", path=self.p("a"))
+        self.assertEqual(d["mode"], "2750")
+
+    def test_inspect_vue_nfs3(self):
+        d = self.ok("inspect", path=self.p("a/f1"))
+        v = d["nfs3_view"]
+        self.assertEqual(v["text"], ["user::rw-", "group::r--", "mask::r--", "other::r--"])
+        self.assertEqual(v["entries_access"], 3)
+        self.assertFalse(v["over_limit"])
+        subprocess.run(["setfacl", "-m", "u:nobody:rwx", self.p("a/f1")], check=True)
+        v = self.ok("inspect", path=self.p("a/f1"))["nfs3_view"]
+        self.assertIn("user:65534:rwx", v["numeric_text"])
+
+    def test_principal_sans_nom_devient_nobody(self):
+        subprocess.run(["setfacl", "-m", "u:54321:r", self.p("a/f1")], check=True)
+        d = self.ok("inspect", path=self.p("a/f1"))
+        self.assertTrue(any(":nobody@" in t for t in d["nfs4_view"]["text"]), d["nfs4_view"]["text"])
+        self.assertTrue(any(":54321:" in t for t in d["nfs4_view"]["numeric_text"]))
+
+
+for _name, _fn in list(vars(_Nfs4ReviewTests).items()):
+    if _name.startswith("test_"):
+        setattr(PermissionsTest, _name, _fn)
+
+
+FAKE_ZFS_NFS = textwrap.dedent(r"""
+    #!/usr/bin/env python3
+    import json, os, sys
+    ds = json.load(open(os.environ["FAKE_DATASETS"]))
+    args = sys.argv[1:]
+    with open(os.environ["FAKE_LOG"], "a") as f:
+        f.write(" ".join(args) + "\n")
+    def sel(name):
+        return [d for d in ds if d["name"] == name or d["name"].startswith(name + "/")]
+    if args[0] == "list":
+        if "-r" in args:
+            for d in sel(args[-1]):
+                print("\t".join([d["name"], d["mountpoint"], d.get("mounted", "yes"), d.get("sharenfs", "off"),
+                                 d.get("acltype", "posix"), d.get("xattr", "sa"), str(d.get("guid", 1))]))
+        else:
+            for d in ds:
+                print("%s\t%s\t%s" % (d["name"], d["mountpoint"], d.get("mounted", "yes")))
+    elif args[0] == "get":
+        if "sharenfs" in args and "-r" in args:
+            for d in sel(args[-1]):
+                print("%s\t%s\t%s" % (d["name"], d.get("sharenfs", "off"), d.get("src", "default")))
+        else:
+            d = [x for x in ds if x["name"] == args[-1]][0]
+            props = {"type": "filesystem", "mountpoint": d["mountpoint"], "mounted": "yes", "readonly": "off",
+                     "acltype": d.get("acltype", "posix"), "aclmode": "discard", "aclinherit": "restricted",
+                     "xattr": d.get("xattr", "sa"), "dnodesize": "legacy", "casesensitivity": "sensitive",
+                     "normalization": "none", "utf8only": "off"}
+            for p in args[args.index("property,value,source") + 1].split(","):
+                print("%s\t%s\tdefault" % (p, props[p]))
+    elif args[0] in ("set", "inherit"):
+        pass
+    else:
+        sys.exit(1)
+""").lstrip()
+
+
+@unittest.skipUnless(os.geteuid() == 0 and shutil.which("setfacl"), "root + paquet acl requis")
+class NfsDatasetsTest(unittest.TestCase):
+    """Sous-onglet NFS : NFSv3 + NFSv4.1 sur tous les datasets, exports, sharenfs."""
+
+    def setUp(self):
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="zfsnfs-"))
+        self.root = os.path.join(self.tmp, "tank")
+        for d in ("", "child", "child2", "child2/sub dir"):
+            os.makedirs(os.path.join(self.root, d), exist_ok=True)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "zfs"), "w") as f:
+            f.write(FAKE_ZFS_NFS)
+        os.chmod(os.path.join(self.bin, "zfs"), 0o755)
+        self.exports = os.path.join(self.tmp, "exports")
+        self.exports_d = os.path.join(self.tmp, "exports.d")
+        os.makedirs(self.exports_d)
+        self.log = os.path.join(self.tmp, "zfs.log")
+        self.dsfile = os.path.join(self.tmp, "ds.json")
+        self.env = dict(os.environ, PATH=self.bin + ":" + os.environ["PATH"], FAKE_LOG=self.log,
+                        FAKE_DATASETS=self.dsfile, COCKPIT_ZFS_EXPORTS=self.exports,
+                        COCKPIT_ZFS_EXPORTS_D=self.exports_d,
+                        COCKPIT_ZFS_PERM_BACKUP_DIR=os.path.join(self.tmp, "backups"))
+        self.set_datasets([
+            {"name": "tank/data", "mountpoint": self.root, "guid": 1111},
+            {"name": "tank/data/child", "mountpoint": self.p("child"), "guid": 2222},
+            {"name": "tank/data/child2", "mountpoint": self.p("child2"), "guid": 3333},
+            {"name": "tank/data/child2/sub", "mountpoint": self.p("child2/sub dir"), "guid": 4444},
+        ])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def p(self, rel):
+        return os.path.join(self.root, rel)
+
+    def set_datasets(self, ds):
+        with open(self.dsfile, "w") as f:
+            json.dump(ds, f)
+
+    def write_exports(self, text, name=None):
+        with open(os.path.join(self.exports_d, name) if name else self.exports, "w") as f:
+            f.write(text)
+
+    def call(self, cmd, **params):
+        out = subprocess.run([sys.executable, SCRIPT, cmd, json.dumps(params)], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, env=self.env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def ok(self, cmd, **params):
+        d = self.call(cmd, **params)
+        self.assertTrue(d["ok"], d)
+        return d
+
+    def readlog(self):
+        if not os.path.exists(self.log):
+            return ""
+        with open(self.log) as f:
+            return f.read()
+
+    def ds(self, d, name):
+        return [x for x in d["datasets"] if x["name"] == name][0]
+
+    def codes(self, d, name):
+        return {f["code"] for f in self.ds(d, name)["findings"]}
+
+    def test_enfant_non_exporte_et_montage_v3(self):
+        self.write_exports("%s 10.0.0.0/24(rw,sync,fsid=1)\n%s 10.0.0.0/24(rw,fsid=2)\n" % (self.root, self.p("child2")))
+        d = self.ok("nfs-datasets", dataset="tank/data")
+        self.assertIn("hidden_child", self.codes(d, "tank/data/child"))
+        self.assertFalse(self.ds(d, "tank/data/child")["compat"]["v3"])
+        self.assertIn("v3_mount_separately", self.codes(d, "tank/data/child2"))
+        self.assertTrue(self.ds(d, "tank/data/child2")["compat"]["v41"])
+        self.assertTrue(self.ds(d, "tank/data")["compat"]["v3"])
+        # sous-dataset dont le chemin contient une espace : enfant de child2, non exporté
+        self.assertIn("hidden_child", self.codes(d, "tank/data/child2/sub"))
+
+    def test_crossmnt_parent(self):
+        self.write_exports("%s *(rw,crossmnt,fsid=1)\n" % self.root)
+        d = self.ok("nfs-datasets", dataset="tank/data")
+        self.assertIn("implicit_child", self.codes(d, "tank/data/child"))
+
+    def test_doublon_sharenfs_et_exports(self):
+        self.set_datasets([{"name": "tank/data", "mountpoint": self.root, "sharenfs": "rw=@10.0.0.0/24",
+                            "src": "local", "guid": 1}])
+        self.write_exports("%s 10.0.0.0/24(rw)\n" % self.root)
+        d = self.ok("nfs-datasets", dataset="tank/data")
+        self.assertIn("duplicate", self.codes(d, "tank/data"))
+
+    def test_fsid_doublon_et_herite(self):
+        self.write_exports("%s *(rw,fsid=7)\n%s *(rw,fsid=7)\n" % (self.root, self.p("child")))
+        d = self.ok("nfs-datasets", dataset="tank/data")
+        self.assertIn("fsid_duplicate", self.codes(d, "tank/data/child"))
+        self.set_datasets([
+            {"name": "tank/data", "mountpoint": self.root, "sharenfs": "rw=@10.0.0.0/24,fsid=9", "src": "local"},
+            {"name": "tank/data/child", "mountpoint": self.p("child"), "sharenfs": "rw=@10.0.0.0/24,fsid=9",
+             "src": "inherited from tank/data"}])
+        self.write_exports("")
+        d = self.ok("nfs-datasets", dataset="tank/data")
+        self.assertIn("fsid_inherited", self.codes(d, "tank/data/child"))
+        self.assertIn("sharenfs_inherited", self.codes(d, "tank/data/child"))
+
+    def test_acltype_off_et_monde(self):
+        self.set_datasets([{"name": "tank/data", "mountpoint": self.root, "acltype": "off", "sharenfs": "on",
+                            "src": "local"}])
+        d = self.ok("nfs-datasets", dataset="tank/data")
+        c = self.codes(d, "tank/data")
+        self.assertIn("no_posix_acl", c)
+        self.assertIn("world", c)
+        self.assertFalse(self.ds(d, "tank/data")["compat"]["v3"])
+
+    def test_generer_exports(self):
+        self.write_exports("%s 10.0.0.0/24(rw,fsid=1)\n" % self.root)
+        with open(self.exports) as f:
+            before = f.read()
+        d = self.ok("nfs-generate", dataset="tank/data", clients=["10.0.0.0/24"], format="exports")
+        names = [l["name"] for l in d["lines"]]
+        self.assertEqual(names, ["tank/data/child", "tank/data/child2", "tank/data/child2/sub"])
+        line = [l["line"] for l in d["lines"] if l["name"] == "tank/data/child2/sub"][0]
+        self.assertIn("sub\\040dir 10.0.0.0/24(rw,sync,no_subtree_check,sec=sys,fsid=", line)
+        self.assertIn("fsid=00000000-0000-0000-0000-00000000115c", line)   # 4444 = 0x115c
+        with open(self.exports) as f:
+            self.assertEqual(f.read(), before)   # rien n'est écrit
+        # les lignes générées, une fois ajoutées, rendent tout compatible
+        self.write_exports(before + d["text"] + "\n")
+        d2 = self.ok("nfs-datasets", dataset="tank/data")
+        self.assertTrue(all(x["compat"]["v3"] and x["compat"]["v41"] for x in d2["datasets"]),
+                        [(x["name"], x["findings"]) for x in d2["datasets"]])
+
+    def test_generer_sharenfs(self):
+        d = self.ok("nfs-generate", dataset="tank/data", clients=["10.0.0.0/24", "hote1"], format="sharenfs")
+        cmd = [c for c in d["commands"] if c["name"] == "tank/data"][0]
+        self.assertEqual(cmd["value"], "rw=@10.0.0.0/24:hote1,sync,no_subtree_check,sec=sys")
+        d = self.call("nfs-generate", dataset="tank/data", clients=["a;b"], format="exports")
+        self.assertFalse(d["ok"])
+        d = self.call("nfs-generate", dataset="tank/data", clients=["*"], options="rw,fsid=3")
+        self.assertFalse(d["ok"])
+
+    def test_edition_sharenfs(self):
+        d = self.ok("nfs-sharenfs", dataset="tank/data/child", value="rw=@10.0.0.0/24,crossmnt")
+        self.assertTrue(d["dry_run"])
+        self.assertEqual(d["command"], "zfs set sharenfs=rw=@10.0.0.0/24,crossmnt tank/data/child")
+        self.assertNotIn("set", self.readlog())
+        for bad in ("rw;id", "rw\nro", "-d", "rw,bogus", "rw ro"):
+            self.assertFalse(self.call("nfs-sharenfs", dataset="tank/data/child", value=bad)["ok"], bad)
+        self.write_exports("%s *(rw)\n" % self.p("child"))
+        self.assertFalse(self.call("nfs-sharenfs", dataset="tank/data/child", value="on")["ok"])
+        self.ok("nfs-sharenfs", dataset="tank/data/child", value="on", force=True, dry_run=False)
+        self.assertIn("set sharenfs=on tank/data/child", self.readlog())
+        self.ok("nfs-sharenfs", dataset="tank/data/child", op="inherit", dry_run=False)
+        self.assertIn("inherit sharenfs tank/data/child", self.readlog())
+        self.assertFalse(self.call("nfs-sharenfs", dataset="-r tank", value="on")["ok"])
+        self.assertFalse(self.call("nfs-datasets", dataset="-r")["ok"])
+        self.assertFalse(self.call("nfs-generate", dataset="-r", clients=["*"])["ok"])
+
+    def test_parse_exports(self):
+        e = ZP.parse_exports_text('/a\\040b host1(rw,sync) -ro \\\n  host2 "/q x" (rw)\n# c\n/z (rw)\n', "/etc/exports")
+        self.assertEqual(e[0]["path"], "/a b")
+        self.assertEqual(e[0]["clients"][1], {"host": "host2", "options": ["ro"]})
+        self.assertEqual(e[1]["clients"][0]["host"], "*")
+        self.assertTrue(e[1]["notes"])
 
 
 if __name__ == "__main__":

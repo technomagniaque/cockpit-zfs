@@ -61,7 +61,7 @@
 					</div>
 				</div>
 				<AclEditor :path="state.path" :acl="state.acl" :aclMode="state.acl_mode" :isDir="state.info.type === 'dir'" @changed="inspect" />
-				<Nfs4Panel :view="state.nfs4_view" :path="state.path" :isDir="state.info.type === 'dir'" />
+				<Nfs4Panel :view="state.nfs4_view" :v3="state.nfs3_view" :path="state.path" :isDir="state.info.type === 'dir'" />
 				<details v-if="state.children.length" class="text-sm">
 					<summary class="cursor-pointer text-default font-medium">Contenu ({{ state.children.length }})</summary>
 					<table class="w-full mt-1 text-xs">
@@ -69,7 +69,7 @@
 						<tbody>
 							<tr v-for="c in state.children" :key="c.path" class="border-t border-default"
 								:class="c.type === 'dir' || c.type === 'file' ? 'hover:bg-accent cursor-pointer' : 'text-muted'"
-								:title="c.type === 'link' ? 'Lien symbolique : non suivi' : c.nfs4_text ? 'Vue NFSv4 :\n' + c.nfs4_text.join('\n') : ''"
+								:title="c.type === 'link' ? 'Lien symbolique : non suivi' : childNfs4(c) ? 'Vue NFSv4 :\n' + childNfs4(c) : ''"
 								@click="(c.type === 'dir' || c.type === 'file') && open(c.path)">
 								<td class="font-mono py-0.5 text-default">{{ basename(c.path) }}{{ c.type === 'dir' ? '/' : c.type === 'link' ? ' →' : '' }}</td>
 								<td class="font-mono text-default">{{ c.symbolic }}</td>
@@ -152,6 +152,9 @@
 			<!-- Délégation zfs allow -->
 			<DelegationPanel v-else-if="tab === 'delegation'" :dataset="state.dataset" />
 
+			<!-- NFSv3 + NFSv4.1 sur tous les datasets -->
+			<NfsPanel v-else-if="tab === 'nfs'" :dataset="state.dataset" />
+
 			<!-- Sauvegardes -->
 			<div v-else-if="tab === 'backups'" class="text-sm space-y-2">
 				<p class="text-muted">
@@ -215,9 +218,10 @@ import AclEditor from './AclEditor.vue';
 import Nfs4Panel from './Nfs4Panel.vue';
 import ResetPanel from './ResetPanel.vue';
 import DelegationPanel from './DelegationPanel.vue';
+import NfsPanel from './NfsPanel.vue';
 import {
 	type InspectResult, type AuditResult, type BackupMeta, type PathInfo,
-	inspectPath, auditPath, listBackups, deleteBackup, applyPreset,
+	inspectPath, auditPath, listBackups, deleteBackup, applyPreset, prefersNumeric,
 } from '../../composables/permissions';
 
 const datasets = inject<Ref<ZFSFileSystemInfo[]>>('datasets')!;
@@ -229,12 +233,13 @@ const selectedDataset = ref('');
 const path = ref('');
 const state = ref<InspectResult | null>(null);
 const busy = ref(false);
-const tab = ref<'acl' | 'reset' | 'audit' | 'delegation' | 'backups' | 'presets'>('acl');
+const tab = ref<'acl' | 'reset' | 'audit' | 'delegation' | 'nfs' | 'backups' | 'presets'>('acl');
 const tabs = [
 	{ id: 'acl', label: 'État & ACL' },
 	{ id: 'reset', label: 'Réinitialiser' },
 	{ id: 'audit', label: 'Audit' },
 	{ id: 'delegation', label: 'Délégation zfs allow' },
+	{ id: 'nfs', label: 'NFS (v3 + v4.1)' },
 	{ id: 'backups', label: 'Sauvegardes' },
 	{ id: 'presets', label: 'Préréglages' },
 ] as const;
@@ -269,6 +274,11 @@ function open(p: string) {
 }
 
 const basename = (p: string) => p.split('/').pop();
+// même rendu que le panneau NFS : numérique quand nfs4_disable_idmapping n'est pas explicitement N
+const childNfs4 = (c: PathInfo) => {
+	const t = prefersNumeric(state.value?.nfs4_view?.idmap) ? c.nfs4_numeric_text : c.nfs4_text;
+	return t?.length ? t.join('\n') : '';
+};
 const flags = (c: PathInfo) => [
 	c.setgid && 'setgid', c.sticky && 'sticky', c.has_posix_acl && 'ACL', c.has_ntacl && 'NTACL', c.immutable && 'immutable',
 	c.nfs4_deny && 'DENY NFSv4',

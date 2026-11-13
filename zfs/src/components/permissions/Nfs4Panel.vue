@@ -1,16 +1,50 @@
 <template>
 	<details class="rounded-md border border-default p-3 text-sm" :open="open">
 		<summary class="cursor-pointer font-semibold text-default">
-			Vue NFSv4 (telle que vue par un client NFSv4.1)
+			Vue NFS (clients NFSv3 et NFSv4.1)
 			<span v-if="view?.deny_count" class="ml-2 text-xs text-warning">{{ view.deny_count }} ACE DENY générée(s)</span>
+			<span v-if="view?.unsupported" class="ml-2 text-xs text-danger">pas d'ACL côté NFS</span>
 		</summary>
-		<div class="mt-2 space-y-3">
+		<div class="mt-2 flex flex-row gap-2">
+			<button v-for="t in (['v4', 'v3'] as const)" :key="t" class="btn text-xs py-0.5 px-2"
+				:class="proto === t ? 'btn-primary' : 'btn-secondary'" @click="proto = t">
+				{{ t === 'v4' ? 'NFSv4.1 (ACL traduites par knfsd)' : 'NFSv3 (nfsacl)' }}
+			</button>
+		</div>
+
+		<!-- NFSv3 : protocole NFSACL -->
+		<div v-if="proto === 'v3'" class="mt-2 space-y-2">
+			<p class="text-muted">
+				En NFSv3, l'ACL POSIX est transmise telle quelle par le protocole NFSACL (fs/nfsd/nfs3acl.c) :
+				<span class="font-mono">getfacl</span> / <span class="font-mono">setfacl</span> côté client voient les
+				mêmes entrées que le serveur. Seule différence : les identifiants circulent en numérique et le client
+				les affiche avec SES comptes. En NFSv4.1, la même ACL devient une liste d'ACE (onglet NFSv4.1),
+				avec éventuellement des ACE DENY générées.
+			</p>
+			<div v-if="v3?.error" class="text-danger">{{ v3.error }}</div>
+			<template v-else-if="v3">
+				<label class="flex items-center gap-2 text-default">
+					<input type="checkbox" v-model="v3Numeric" class="input-checkbox" />
+					identifiants numériques (client sans les mêmes comptes)
+				</label>
+				<pre class="font-mono text-xs rounded bg-accent p-2 text-default whitespace-pre-wrap">{{ (v3Numeric ? v3.numeric_text : v3.text)?.join('\n') }}</pre>
+				<div class="text-xs" :class="v3.over_limit ? 'text-danger' : 'text-muted'">
+					Entrées : accès {{ v3.entries_access }}, défaut {{ v3.entries_default }} — limite NFS_ACL_MAX_ENTRIES {{ v3.limit }} par ACL
+				</div>
+				<ul v-if="v3.notes?.length" class="list-disc pl-5 text-muted">
+					<li v-for="n in v3.notes" :key="n">{{ n }}</li>
+				</ul>
+			</template>
+		</div>
+
+		<div v-else class="mt-2 space-y-3">
 			<p class="text-muted">
 				OpenZFS sous Linux stocke des ACL POSIX ; le serveur NFS du noyau (knfsd) les présente aux clients
 				NFSv4 sous forme d'ACL NFSv4 et retraduit en POSIX celles qu'ils posent avec
 				<span class="font-mono">nfs4_setfacl</span> (fs/nfsd/nfs4acl.c).
 			</p>
 			<div v-if="view?.error" class="text-danger">{{ view.error }}</div>
+			<div v-else-if="view?.unsupported" class="rounded border border-default p-2 text-danger">{{ view.message }}</div>
 			<template v-else-if="view">
 				<div class="flex flex-row flex-wrap gap-4 items-center">
 					<label class="flex items-center gap-2 text-default">
@@ -55,7 +89,7 @@
 						<input type="checkbox" v-model="otherClient" class="input-checkbox" /> client autre que nfs4_setfacl
 					</label>
 					<button class="btn btn-secondary" :disabled="busy || !testAcl.trim()" @click="runTest">Tester</button>
-					<button class="btn btn-secondary" :disabled="!view?.text" @click="testAcl = (view?.text ?? []).join('\n')">Partir de l'ACL actuelle</button>
+					<button class="btn btn-secondary" :disabled="!currentText.length" @click="testAcl = currentText.join('\n')">Partir de l'ACL actuelle</button>
 				</div>
 				<div v-if="result" class="rounded border border-default p-2 space-y-1">
 					<div :class="result.representable ? 'text-success' : 'text-danger'">
@@ -65,6 +99,10 @@
 					<template v-if="result.representable">
 						<div class="text-default">ACL POSIX stockée (mode résultant <span class="font-mono">{{ result.mode }}</span>) :</div>
 						<pre class="font-mono text-xs text-default">{{ fmt(result.access) }}<template v-if="result.default?.length">{{ '\n' + fmt(result.default, 'default:') }}</template></pre>
+						<div v-if="result.default_unchanged" class="text-warning">
+							ACL par défaut inchangée (aucune ACE héritable envoyée)<template v-if="result.current_default?.length"> :</template>
+						</div>
+						<pre v-if="result.default_unchanged && result.current_default?.length" class="font-mono text-xs text-default">{{ fmt(result.current_default, 'default:') }}</pre>
 						<div class="text-default">Relue ensuite par le client :</div>
 						<pre class="font-mono text-xs text-default">{{ result.readback?.join('\n') }}</pre>
 					</template>
@@ -78,13 +116,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, computed } from 'vue';
 import { pushNotification, Notification } from '@45drives/houston-common-ui';
-import { type Nfs4View, type Nfs4TranslateResult, type AclEntry, nfs4Translate } from '../../composables/permissions';
+import { type Nfs4View, type Nfs3View, type Nfs4TranslateResult, type AclEntry, nfs4Translate, prefersNumeric } from '../../composables/permissions';
 
-const props = defineProps<{ view: Nfs4View | null; path: string; isDir: boolean; open?: boolean }>();
+const props = defineProps<{ view: Nfs4View | null; v3?: Nfs3View | null; path: string; isDir: boolean; open?: boolean }>();
 
-const numeric = ref(false);
+// nfs4_disable_idmapping vaut Y par défaut : en sec=sys le client voit des identifiants numériques
+const numeric = ref(prefersNumeric(props.view?.idmap));
+const v3Numeric = ref(false);
+const proto = ref<'v4' | 'v3'>('v4');
+const currentText = computed(() => (numeric.value ? props.view?.numeric_text : props.view?.text) ?? []);
 const testAcl = ref('');
 const asDir = ref(props.isDir);
 const otherClient = ref(false);
@@ -95,6 +137,9 @@ watch(() => [props.path, props.isDir], () => {
 	asDir.value = props.isDir;
 	result.value = null;
 });
+watch(() => props.view?.idmap?.disable_idmapping, () => {
+	numeric.value = prefersNumeric(props.view?.idmap);
+});
 
 function fmt(entries: AclEntry[] | undefined, prefix = '') {
 	return (entries ?? []).map((e) => `${prefix}${e.tag}:${e.qualifier}:${e.perms}`).join('\n');
@@ -103,7 +148,7 @@ function fmt(entries: AclEntry[] | undefined, prefix = '') {
 async function runTest() {
 	busy.value = true;
 	try {
-		result.value = await nfs4Translate({ acl: testAcl.value, is_dir: asDir.value, client: otherClient.value ? 'autre' : 'nfs4_setfacl' });
+		result.value = await nfs4Translate({ acl: testAcl.value, path: props.path, is_dir: asDir.value, client: otherClient.value ? 'autre' : 'nfs4_setfacl' });
 	} catch (e: any) {
 		pushNotification(new Notification('Test impossible', e.message, 'error', 6000));
 	} finally {

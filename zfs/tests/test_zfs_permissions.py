@@ -1192,12 +1192,13 @@ class NfsDatasetsTest(unittest.TestCase):
                 #!/usr/bin/env python3
                 import sys
                 args = sys.argv[1:]
-                if args[:2] == ["list", "-Hpo"] and "-t" in args:
+                if args[0] == "list" and args[1] in ("-Hpo", "-Ho") and "-t" in args:
+                    raw = args[1] == "-Hpo"
                     t = args[args.index("-t") + 1]
                     cols = args[2].split(",")
                     if t == "filesystem,volume":
                         if cols == ["name"]:
-                            print("tank\\ntank/partage")
+                            print("tank\\ntank/partage\\ntank/partage/sous")
                         else:
                             r1 = {
                                 "name": "tank", "type": "filesystem", "guid": "1001", "creation": "1700000000",
@@ -1208,11 +1209,22 @@ class NfsDatasetsTest(unittest.TestCase):
                                 "refquota": "0", "available": "10737418240", "used": "1048576",
                                 "usedbychildren": "524288", "usedbydataset": "524288", "usedbyrefreservation": "0",
                                 "usedbysnapshots": "0", "volblocksize": "-", "volsize": "-", "sync": "standard",
-                                "xattr": "sa", "acltype": "posixacl",
+                                "xattr": "sa", "acltype": "posixacl", "canmount": "on", "aclinherit": "restricted",
+                                "checksum": "on", "refreservation": "0", "snapshot_count": "0",
                             }
-                            r2 = dict(r1, name="tank/partage", guid="1002", mountpoint="/tank/partage")
-                            print("\\t".join(r1[c] for c in cols))
-                            print("\\t".join(r2[c] for c in cols))
+                            if not raw:
+                                r1.update({
+                                    "creation": "Tue Nov 14 22:13 2023", "quota": "none", "recordsize": "128K",
+                                    "refquota": "none", "available": "10G", "used": "1M",
+                                    "usedbychildren": "512K", "usedbydataset": "512K", "usedbyrefreservation": "0B",
+                                    "usedbysnapshots": "0B", "refreservation": "none",
+                                })
+                            r2 = dict(r1, name="tank/partage", guid="1002", mountpoint="/tank/partage",
+                                      aclinherit="passthrough", canmount="noauto",
+                                      recordsize="1048576" if raw else "1M")
+                            r3 = dict(r2, name="tank/partage/sous", guid="1003", mountpoint="/tank/partage/sous")
+                            for r in (r1, r2, r3):
+                                print("\\t".join(r[c] for c in cols))
                     elif t == "snapshot":
                         row = {
                             "name": "tank/partage@snap1", "guid": "9001", "creation": "1700000100",
@@ -1228,10 +1240,24 @@ class NfsDatasetsTest(unittest.TestCase):
             env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True,
         )
         ds = json.loads(r_ds.stdout)
-        self.assertEqual(len(ds), 1)
-        self.assertEqual(ds[0]["name"], "tank")
-        self.assertEqual(ds[0]["children"][0]["name"], "tank/partage")
-        self.assertEqual(ds[0]["children"][0]["properties"]["acltype"]["value"], "posixacl")
+        # liste plate comme libzfs : tous les datasets, enfants directs dans children
+        self.assertEqual([d["name"] for d in ds], ["tank", "tank/partage", "tank/partage/sous"])
+        by = {d["name"]: d for d in ds}
+        self.assertEqual([c["name"] for c in by["tank"]["children"]], ["tank/partage"])
+        self.assertEqual([c["name"] for c in by["tank/partage"]["children"]], ["tank/partage/sous"])
+        p = by["tank/partage"]["properties"]
+        self.assertEqual(p["acltype"]["value"], "posixacl")
+        self.assertEqual(p["aclinherit"]["value"], "passthrough")
+        self.assertEqual(p["canmount"]["value"], "noauto")
+        self.assertEqual(p["recordsize"]["value"], "1M")
+        self.assertEqual(p["recordsize"]["parsed"], 1048576)
+        self.assertEqual(by["tank"]["properties"]["recordsize"]["value"], "128K")
+        self.assertEqual(by["tank"]["properties"]["quota"]["value"], "none")
+        self.assertEqual(by["tank"]["properties"]["quota"]["parsed"], 0)
+        self.assertEqual(by["tank"]["properties"]["available"]["parsed"], 10737418240)
+        self.assertIs(by["tank"]["properties"]["mounted"]["parsed"], True)
+        self.assertEqual(by["tank"]["properties"]["refreservation"]["value"], "none")
+        self.assertEqual(by["tank"]["properties"]["creation"]["rawvalue"], "1700000000")
 
         r_sn = subprocess.run(
             [sys.executable, os.path.join(scripts_dir, "get-snapshots.py"), "all"],

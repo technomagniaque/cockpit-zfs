@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*ABCs.*collections.*")
+import datetime
 import json
 import subprocess
 import sys
@@ -34,23 +35,91 @@ def _parse_bool(val, default=False):
     return default
 
 
-def _datasets_from_zfs_list():
-    """Fallback CLI (`zfs list` / `zfs get`) lorsque python3-libzfs est absent (Debian 13 Trixie)."""
+# Propriétés lues par le repli CLI ; toutes existent dans OpenZFS 2.x pour les
+# systèmes de fichiers et les volumes (`-` quand elles ne s'appliquent pas).
+_FALLBACK_PROPS = [
+    "name", "type", "guid", "creation", "atime", "casesensitivity",
+    "compression", "dedup", "dnodesize", "encryption", "encryptionroot",
+    "keystatus", "logbias", "mlslabel", "mountpoint", "mounted",
+    "quota", "readonly", "recordsize", "refquota", "available", "used",
+    "usedbychildren", "usedbydataset", "usedbyrefreservation",
+    "usedbysnapshots", "volblocksize", "volsize", "sync", "xattr", "acltype",
+    "canmount", "aclinherit", "checksum", "refreservation", "snapshot_count",
+]
+
+# Propriétés dont libzfs expose `parsed` sous forme d'entier (octets ou compteur).
+_INT_PROPS = {
+    "quota", "refquota", "available", "used", "usedbychildren", "usedbydataset",
+    "usedbyrefreservation", "usedbysnapshots", "volblocksize", "volsize",
+    "recordsize", "refreservation", "snapshot_count",
+}
+# Propriétés on/off ou yes/no dont libzfs expose `parsed` sous forme de booléen.
+_BOOL_PROPS = {"atime", "readonly", "mounted"}
+
+
+def _zfs_list_rows(props, raw):
+    """`zfs list -H[p]o` → {nom: {propriété: valeur}} ; None si la commande échoue."""
+    flags = "-Hpo" if raw else "-Ho"
+    res = subprocess.run(
+        ["zfs", "list", flags, ",".join(props), "-t", "filesystem,volume"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+    )
+    if res.returncode != 0:
+        print(f"Warning: zfs list {flags} failed: {res.stderr.strip()}", file=sys.stderr)
+        return None
+    rows = {}
+    order = []
+    for line in res.stdout.splitlines():
+        if not line:
+            continue
+        cols = line.split("\t")
+        if len(cols) != len(props):
+            print(f"Warning: zfs list: unexpected line: {line!r}", file=sys.stderr)
+            continue
+        row = dict(zip(props, cols))
+        rows[row["name"]] = row
+        order.append(row["name"])
+    return rows, order
+
+
+def _creation_parsed(raw):
+    """Même rendu que str(datetime) de libzfs (heure locale)."""
     try:
-        props = [
-            "name", "type", "guid", "creation", "atime", "casesensitivity",
-            "compression", "dedup", "dnodesize", "encryption", "encryptionroot",
-            "keystatus", "logbias", "mlslabel", "mountpoint", "mounted",
-            "quota", "readonly", "recordsize", "refquota", "available", "used",
-            "usedbychildren", "usedbydataset", "usedbyrefreservation",
-            "usedbysnapshots", "volblocksize", "volsize", "sync", "xattr", "acltype",
-        ]
-        res = subprocess.run(
-            ["zfs", "list", "-Hpo", ",".join(props), "-t", "filesystem,volume"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
-        )
-        if res.returncode != 0:
+        return str(datetime.datetime.fromtimestamp(int(raw)))
+    except (ValueError, TypeError, OverflowError, OSError):
+        return raw
+
+
+def _prop(name, raw, value):
+    if name in _INT_PROPS:
+        default = 131072 if name == "recordsize" else 0
+        parsed = _parse_int(raw, default)
+    elif name in _BOOL_PROPS:
+        parsed = _parse_bool(raw, name == "atime")
+    elif name == "creation":
+        parsed = _creation_parsed(raw)
+    else:
+        parsed = raw
+    return {"parsed": parsed, "rawvalue": raw, "value": value}
+
+
+def _datasets_from_zfs_list():
+    """Repli CLI (`zfs list` / `zfs get`) lorsque python3-libzfs est absent (Debian 13 Trixie).
+
+    Produit la même forme que libzfs : une liste PLATE de tous les systèmes de
+    fichiers et volumes (`zfs.datasets` parcourt aussi les descendants), chacun
+    avec ses enfants directs dans `children`. `value` est la valeur lisible
+    (`zfs list -Ho` : 128K, none, date…), `rawvalue` la valeur brute (`-Hpo`),
+    `parsed` la valeur typée (entier, booléen).
+    """
+    try:
+        props = _FALLBACK_PROPS
+        raw_res = _zfs_list_rows(props, raw=True)
+        if raw_res is None:
             return []
+        raw_rows, order = raw_res
+        fmt_res = _zfs_list_rows(props, raw=False)
+        fmt_rows = fmt_res[0] if fmt_res is not None else {}
 
         custom_map = {}
         res_custom = subprocess.run(
@@ -62,77 +131,47 @@ def _datasets_from_zfs_list():
                 parts = cline.split("\t", 1)
                 if len(parts) == 2:
                     custom_map[parts[0]] = parts[1]
+        else:
+            print(f"Warning: zfs get cockpit:encrypted failed: {res_custom.stderr.strip()}", file=sys.stderr)
 
         by_name = {}
-        roots = []
-        for line in res.stdout.strip().splitlines():
-            if not line:
-                continue
-            cols = line.split("\t")
-            if len(cols) < len(props):
-                continue
-            row = dict(zip(props, cols))
-            name = row["name"]
+        flat = []
+        for name in order:
+            row = raw_rows[name]
+            fmt = fmt_rows.get(name, row)
             pool_name = name.split("/", 1)[0]
-            ds_type = row["type"].upper()
             enc_val = row["encryption"]
             cockpit_enc = custom_map.get(name, "-")
             is_encrypted = (enc_val not in ("off", "-")) or _parse_bool(cockpit_enc, False)
 
+            properties = {}
+            for prop in props:
+                if prop in ("name", "type"):
+                    continue
+                properties[prop] = _prop(prop, row[prop], fmt.get(prop, row[prop]))
+            # alias historiques attendus par certains écrans
+            properties["Quota"] = properties["quota"]
+            properties["Refquota"] = properties["refquota"]
+            properties["cockpit:encrypted"] = {"parsed": cockpit_enc, "rawvalue": cockpit_enc, "value": cockpit_enc}
+
             ds = {
                 "name": name,
                 "pool": pool_name,
-                "type": ds_type,
+                "type": row["type"].upper(),
                 "id": name,
                 "mountpoint": row["mountpoint"],
                 "encrypted": is_encrypted,
                 "key_loaded": row["keystatus"] == "available",
                 "children": [],
-                "properties": {
-                    "guid": {"parsed": row["guid"], "value": row["guid"]},
-                    "encryption": {"parsed": enc_val, "value": enc_val},
-                    "keystatus": {"parsed": row["keystatus"], "value": row["keystatus"]},
-                    "creation": {"parsed": row["creation"], "rawvalue": row["creation"], "value": row["creation"]},
-                    "atime": {"parsed": _parse_bool(row["atime"], True), "value": row["atime"]},
-                    "casesensitivity": {"parsed": row["casesensitivity"], "value": row["casesensitivity"]},
-                    "compression": {"parsed": row["compression"], "value": row["compression"]},
-                    "dedup": {"parsed": row["dedup"], "value": row["dedup"]},
-                    "dnodesize": {"parsed": row["dnodesize"], "value": row["dnodesize"]},
-                    "encryptionroot": {"parsed": row["encryptionroot"], "value": row["encryptionroot"]},
-                    "logbias": {"parsed": row["logbias"], "value": row["logbias"]},
-                    "mlslabel": {"parsed": row["mlslabel"], "value": row["mlslabel"]},
-                    "mountpoint": {"parsed": row["mountpoint"], "value": row["mountpoint"]},
-                    "Quota": {"parsed": _parse_int(row["quota"]), "value": row["quota"]},
-                    "quota": {"parsed": _parse_int(row["quota"]), "value": row["quota"]},
-                    "readonly": {"parsed": _parse_bool(row["readonly"], False), "value": row["readonly"]},
-                    "recordsize": {"parsed": _parse_int(row["recordsize"], 131072), "value": row["recordsize"]},
-                    "refquota": {"parsed": _parse_int(row["refquota"]), "value": row["refquota"]},
-                    "Refquota": {"parsed": _parse_int(row["refquota"]), "value": row["refquota"]},
-                    "available": {"parsed": _parse_int(row["available"]), "value": row["available"]},
-                    "used": {"parsed": _parse_int(row["used"]), "value": row["used"]},
-                    "usedbychildren": {"parsed": _parse_int(row["usedbychildren"]), "value": row["usedbychildren"]},
-                    "usedbydataset": {"parsed": _parse_int(row["usedbydataset"]), "value": row["usedbydataset"]},
-                    "usedbyrefreservation": {"parsed": _parse_int(row["usedbyrefreservation"]), "value": row["usedbyrefreservation"]},
-                    "usedbysnapshots": {"parsed": _parse_int(row["usedbysnapshots"]), "value": row["usedbysnapshots"]},
-                    "volsize": {"parsed": _parse_int(row["volsize"]), "value": row["volsize"]},
-                    "volblocksize": {"parsed": _parse_int(row["volblocksize"]), "value": row["volblocksize"]},
-                    "sync": {"parsed": row["sync"], "value": row["sync"]},
-                    "mounted": {"parsed": _parse_bool(row["mounted"], False), "value": row["mounted"]},
-                    "xattr": {"parsed": row["xattr"], "value": row["xattr"]},
-                    "acltype": {"parsed": row["acltype"], "value": row["acltype"]},
-                    "cockpit:encrypted": {"parsed": cockpit_enc, "value": cockpit_enc},
-                },
+                "properties": properties,
             }
             by_name[name] = ds
+            flat.append(ds)
             if "/" in name:
-                parent_name = name.rsplit("/", 1)[0]
-                if parent_name in by_name:
-                    by_name[parent_name]["children"].append(ds)
-                else:
-                    roots.append(ds)
-            else:
-                roots.append(ds)
-        return roots
+                parent = by_name.get(name.rsplit("/", 1)[0])
+                if parent is not None:
+                    parent["children"].append(ds)
+        return flat
     except Exception as e:
         print(f"Warning: fallback zfs list failed: {e}", file=sys.stderr)
         return []

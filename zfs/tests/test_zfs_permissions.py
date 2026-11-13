@@ -1228,8 +1228,10 @@ class NfsDatasetsTest(unittest.TestCase):
                     elif t == "snapshot":
                         row = {
                             "name": "tank/partage@snap1", "guid": "9001", "creation": "1700000100",
-                            "referenced": "524288", "used": "0", "clones": "-",
+                            "referenced": "1288490188", "used": "0", "clones": "-",
                         }
+                        if not raw:
+                            row.update(creation="Tue Nov 14 22:15 2023", referenced="1.20G", used="0B")
                         print("\\t".join(row[c] for c in cols))
                 elif args[:2] == ["get", "-Hpo"]:
                     print("tank\\t-\\ntank/partage\\t-")
@@ -1267,6 +1269,23 @@ class NfsDatasetsTest(unittest.TestCase):
         self.assertIn("tank/partage", sn)
         self.assertEqual(sn["tank/partage"][0]["snapshot_name"], "snap1")
         self.assertEqual(sn["tank/partage"][0]["id"], "9001")
+        sp = sn["tank/partage"][0]["properties"]
+        # lisible comme libzfs, brut et typé à côté (tri du front sur rawvalue)
+        self.assertEqual((sp["referenced"]["value"], sp["referenced"]["rawvalue"], sp["referenced"]["parsed"]),
+                         ("1.20G", "1288490188", 1288490188))
+        self.assertEqual(sp["used"]["value"], "0B")
+        self.assertEqual(sp["creation"]["value"], "Tue Nov 14 22:15 2023")
+        self.assertEqual(sp["creation"]["rawvalue"], "1700000100")
+        self.assertRegex(sp["creation"]["parsed"], r"^2023-11-1[45] \d{2}:\d{2}:\d{2}$")
+
+        # nom refusé (option déguisée) : erreur sur stderr, code non nul, aucun appel à zfs
+        bad = subprocess.run(
+            [sys.executable, os.path.join(scripts_dir, "get-snapshots.py"), "dataset:-o"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("invalide", bad.stderr)
+        self.assertEqual(bad.stdout, "")
 
 ZPOOL_IMPORT_FIXTURE = (
     "   pool: H1\n"
